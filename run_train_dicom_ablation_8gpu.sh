@@ -21,10 +21,12 @@ fi
 
 TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
-CHECKPOINT_BASE="${CHECKPOINT_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/qwen/safe_film_context_v1}"
-LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/safe_film_context_v1_$(date +%Y%m%d_%H%M%S)}"
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v1}"
+LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/llama_safe_film_context_v1_$(date +%Y%m%d_%H%M%S)}"
 
-LLM_REPO="${LLM_REPO:-${PROJECT_DIR}/model_custom/qwen3/Qwen3-8B-Base/}"
+# The hk copy currently contains only Llama config/tokenizer/index files.
+# Reuse the complete read-only weight directory from jhk unless LLM_REPO is overridden.
+LLM_REPO="${LLM_REPO:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf/}"
 PRETRAINED="${PRETRAINED:-}"
 
 PATCH_SIZE="${PATCH_SIZE:-32 224 224}"
@@ -85,6 +87,26 @@ if [ -n "$ONLY_EXPERIMENTS" ]; then
     EXPERIMENTS=("${FILTERED_EXPERIMENTS[@]}")
     if [ "${#EXPERIMENTS[@]}" -eq 0 ]; then
         echo "[ERROR] ONLY_EXPERIMENTS matched no configured experiments: $ONLY_EXPERIMENTS"
+        exit 1
+    fi
+fi
+
+NEEDS_LLM=0
+for experiment in "${EXPERIMENTS[@]}"; do
+    IFS='|' read -r check_name check_dicom check_context check_freeze <<< "$experiment"
+    if [ "$check_context" = "True" ]; then
+        NEEDS_LLM=1
+        break
+    fi
+done
+if [ "$NEEDS_LLM" = "1" ]; then
+    if [ ! -f "${LLM_REPO%/}/config.json" ]; then
+        echo "[ERROR] Llama config not found: ${LLM_REPO%/}/config.json"
+        exit 1
+    fi
+    if ! compgen -G "${LLM_REPO%/}/model-*.safetensors" > /dev/null \
+       && ! compgen -G "${LLM_REPO%/}/pytorch_model-*.bin" > /dev/null; then
+        echo "[ERROR] Llama weight shards not found under: $LLM_REPO"
         exit 1
     fi
 fi

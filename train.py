@@ -222,7 +222,12 @@ def get_args_parser():
     parser.add_argument('--num_classes', default=1, type=int)
 
    # LLM backbone repo (HF)
-    parser.add_argument('--llm_repo', default="Qwen/Qwen3-8B-Base", type=str, help='HF repo id for LLM backbone (e.g., Qwen/Qwen3-8B-Base, meta-llama/Llama-2-7b-hf, ...)')
+    parser.add_argument(
+        '--llm_repo',
+        default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf/",
+        type=str,
+        help='Local path or HF repo id for the frozen Llama text backbone.',
+    )
     parser.add_argument('--use_lora', action=argparse.BooleanOptionalAction, default=False, help='Use PEFT LoRA for LLM backbone')
 
 

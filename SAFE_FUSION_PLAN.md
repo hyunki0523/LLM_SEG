@@ -3,6 +3,7 @@
 ## 확정된 입력
 
 - Text: `extracted_cc`, `chief_complaint`
+- Text backbone: frozen `Llama-2-7b-chat-hf`
 - DICOM numeric: `KVP`, `PixelSpacing` X/Y, `SliceThickness`,
   `XRayTubeCurrent`와 각 값의 missing indicator
 - DICOM categorical: `Manufacturer`, `ConvolutionKernel`

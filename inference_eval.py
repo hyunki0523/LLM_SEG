@@ -811,7 +811,11 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", type=str, required=True, help="Path to best/final pth")
     parser.add_argument("--save_root", type=str, required=True, help="Path to save predictions")
     parser.add_argument("--csv_path", type=str, required=True, help="Path to eval csv or xlsx (must have 'image_path' and 'mask_path')")
-    parser.add_argument("--llm_repo", type=str, default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk/model_custom/qwen3/Qwen3-8B-Base")
+    parser.add_argument(
+        "--llm_repo",
+        type=str,
+        default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf/",
+    )
     parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=False, help="Use PEFT LoRA for LLM backbone")
     parser.add_argument("--patch_size", type=int, nargs=3, default=[32, 224, 224])
     parser.add_argument("--device", type=int, default=0)

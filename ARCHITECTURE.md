@@ -4,6 +4,7 @@
 
 - Vision input: three-window 3D CT patch.
 - Clinical text: `extracted_cc` and `chief_complaint` only.
+- Text backbone: frozen Llama-2-7b-chat-hf (primary experiments).
 - Prohibited text: report body/conclusion, radiology history, raw/refined EMR,
   `class`, and `subclass`.
 - DICOM metadata is never converted to text.
