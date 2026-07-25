@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# Local agent/editor state
+.agents/
+.claude/
+.codex/
+.DS_Store
+Thumbs.db
+
+# Model weights and Hugging Face caches
+*.safetensors
+*.bin
+*.pth
+*.pt
+*.ckpt
+*.model
+**/.cache/
+model_custom/BioMistral-7B-DARE/
+model_custom/llama2/Llama-2-7b-chat-hf/
+model_custom/qwen3/Qwen3-8B-Base/
+
+# Training and evaluation outputs
+train_logs/
+inference_logs/
+inference_result/
+metric_results/
+wandb/
+_debug_ckpt/
+inference_recent.log
+tea_debug.log
+*_launcher.log
+dataset_contract_report.json
+wandb_key.txt
+
+# Large local datasets/artifacts
+prompts.csv
+Notebook/
+*.ipynb

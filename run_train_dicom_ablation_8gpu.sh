@@ -1,0 +1,395 @@
+#!/bin/bash
+set -euo pipefail
+
+# Train modality-safe ablations with four 2-GPU jobs:
+#   slot0 -> GPU 0,1
+#   slot1 -> GPU 2,3
+#   slot2 -> GPU 4,5
+#   slot3 -> GPU 6,7
+#
+# DICOM metadata uses FiLM only. LLM text is restricted to extracted_cc and
+# chief_complaint. Reports, refined EMR, labels, demographics and CFG are disabled.
+
+PROJECT_DIR="${PROJECT_DIR:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk}"
+PYTHON_EXE="${PYTHON_EXE:-python}"
+
+if [ -f "${PROJECT_DIR}/wandb_key.txt" ]; then
+    # Local credential file; excluded from Git.
+    WANDB_API_KEY="$(tr -d '\r\n' < "${PROJECT_DIR}/wandb_key.txt")"
+    export WANDB_API_KEY
+fi
+
+TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
+VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/qwen/safe_film_context_v1}"
+LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/safe_film_context_v1_$(date +%Y%m%d_%H%M%S)}"
+
+LLM_REPO="${LLM_REPO:-${PROJECT_DIR}/model_custom/qwen3/Qwen3-8B-Base/}"
+PRETRAINED="${PRETRAINED:-}"
+
+PATCH_SIZE="${PATCH_SIZE:-32 224 224}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+EPOCHS="${EPOCHS:-300}"
+N_ITER_PER_EPOCH="${N_ITER_PER_EPOCH:-256}"
+N_ITER_VALID="${N_ITER_VALID:-50}"
+CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-10}"
+POSITIVE_PROB="${POSITIVE_PROB:-0.80}"
+LOSS_FCT="${LOSS_FCT:-tversky}"
+MIXED_PRECISION_MODE="${MIXED_PRECISION_MODE:-bf16}"
+GRAD_ACCUM="${GRAD_ACCUM:-8}"
+NUM_WORKERS="${NUM_WORKERS:-6}"
+CFG_SCALE=1
+BASE_PORT="${BASE_PORT:-29600}"
+CHECK_IMAGE_PATHS="${CHECK_IMAGE_PATHS:-1}"
+SKIP_MISSING_IMAGE_PATHS="${SKIP_MISSING_IMAGE_PATHS:-1}"
+DEFAULT_IMAGE_PATH_REWRITE_FROM="/mnt/nas100/Brain_ER/data/BrainCT_NIfTIv2"
+DEFAULT_IMAGE_PATH_REWRITE_TO="/mnt/nas100/Brain_ER/IDs/kevin/BrainCT_NIfTIv2"
+IMAGE_PATH_REWRITE_FROM="${IMAGE_PATH_REWRITE_FROM:-${LLMSEG_IMAGE_PATH_REWRITE_FROM:-$DEFAULT_IMAGE_PATH_REWRITE_FROM}}"
+IMAGE_PATH_REWRITE_TO="${IMAGE_PATH_REWRITE_TO:-${LLMSEG_IMAGE_PATH_REWRITE_TO:-$DEFAULT_IMAGE_PATH_REWRITE_TO}}"
+
+if [ -n "${GPU_PAIRS:-}" ]; then
+    read -r -a GPU_PAIR_LIST <<< "$GPU_PAIRS"
+else
+    GPU_PAIR_LIST=("0,1" "2,3" "4,5" "6,7")
+fi
+MAX_PARALLEL="${MAX_PARALLEL:-4}"
+RUN_EXTRA_MODES="${RUN_EXTRA_MODES:-0}"
+OVERWRITE_TRAIN="${OVERWRITE_TRAIN:-0}"
+ONLY_EXPERIMENTS="${ONLY_EXPERIMENTS:-}"
+AUTO_RESUME="${AUTO_RESUME:-1}"
+
+CORE_EXPERIMENTS=(
+    "vision_only|False|False|False"
+    "dicom_film|True|False|False"
+    "text_safe|False|True|False"
+    "dicom_text_safe|True|True|False"
+)
+
+EXTRA_EXPERIMENTS=(
+    "dicom_film_frozen|True|False|True"
+    "dicom_text_safe_frozen|True|True|True"
+)
+
+EXPERIMENTS=("${CORE_EXPERIMENTS[@]}")
+if [ "$RUN_EXTRA_MODES" = "1" ]; then
+    EXPERIMENTS+=("${EXTRA_EXPERIMENTS[@]}")
+fi
+if [ -n "$ONLY_EXPERIMENTS" ]; then
+    FILTERED_EXPERIMENTS=()
+    for experiment in "${EXPERIMENTS[@]}"; do
+        exp_name="${experiment%%|*}"
+        if [[ ",$ONLY_EXPERIMENTS," == *",$exp_name,"* ]]; then
+            FILTERED_EXPERIMENTS+=("$experiment")
+        fi
+    done
+    EXPERIMENTS=("${FILTERED_EXPERIMENTS[@]}")
+    if [ "${#EXPERIMENTS[@]}" -eq 0 ]; then
+        echo "[ERROR] ONLY_EXPERIMENTS matched no configured experiments: $ONLY_EXPERIMENTS"
+        exit 1
+    fi
+fi
+
+mkdir -p "$LOG_ROOT" "$CHECKPOINT_BASE"
+cd "$PROJECT_DIR"
+
+PY_SITE=$($PYTHON_EXE -c "import site; print(site.getsitepackages()[0])")
+export LD_LIBRARY_PATH="$PY_SITE/nvidia/nvjitlink/lib:$PY_SITE/nvidia/cuda_runtime/lib:${LD_LIBRARY_PATH:-}"
+export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export USE_TORCHAUDIO="${USE_TORCHAUDIO:-0}"
+export TRANSFORMERS_NO_TORCHAUDIO="${TRANSFORMERS_NO_TORCHAUDIO:-1}"
+export TRANSFORMERS_NO_AUDIO="${TRANSFORMERS_NO_AUDIO:-1}"
+export LLMSEG_DISABLE_TORCHAUDIO="${LLMSEG_DISABLE_TORCHAUDIO:-1}"
+export TRAIN_CSV VALID_CSV
+export LLMSEG_SKIP_MISSING_IMAGE_PATHS="$SKIP_MISSING_IMAGE_PATHS"
+export LLMSEG_IMAGE_PATH_REWRITE_FROM="$IMAGE_PATH_REWRITE_FROM"
+export LLMSEG_IMAGE_PATH_REWRITE_TO="$IMAGE_PATH_REWRITE_TO"
+
+echo "[INFO] Checking required Python packages..."
+$PYTHON_EXE - <<'PY' || {
+import importlib.util
+import sys
+
+missing = [name for name in ["nibabel"] if importlib.util.find_spec(name) is None]
+if missing:
+    print("[MISSING] " + " ".join(missing))
+    sys.exit(1)
+PY
+    $PYTHON_EXE -m pip install --quiet nibabel || $PYTHON_EXE -m pip install nibabel
+}
+
+$PYTHON_EXE - <<'PY'
+import nibabel
+print(f"[CHECK] nibabel={nibabel.__version__}")
+PY
+
+echo "[INFO] Auditing multimodal data contract..."
+$PYTHON_EXE audit_dataset_contract.py \
+    --train-csv "$TRAIN_CSV" \
+    --valid-csv "$VALID_CSV" \
+    --output "$LOG_ROOT/dataset_contract_report.json"
+
+echo "[INFO] PROJECT_DIR=$PROJECT_DIR"
+echo "[INFO] TRAIN_CSV=$TRAIN_CSV"
+echo "[INFO] VALID_CSV=$VALID_CSV"
+echo "[INFO] CHECKPOINT_BASE=$CHECKPOINT_BASE"
+echo "[INFO] PRETRAINED=${PRETRAINED:-<none>}"
+echo "[INFO] LOG_ROOT=$LOG_ROOT"
+echo "[INFO] GPU_PAIRS=${GPU_PAIR_LIST[*]}"
+echo "[INFO] MAX_PARALLEL=$MAX_PARALLEL"
+echo "[INFO] RUN_EXTRA_MODES=$RUN_EXTRA_MODES"
+echo "[INFO] ONLY_EXPERIMENTS=${ONLY_EXPERIMENTS:-<all>}"
+echo "[INFO] AUTO_RESUME=$AUTO_RESUME"
+echo "[INFO] CHECK_IMAGE_PATHS=$CHECK_IMAGE_PATHS"
+echo "[INFO] SKIP_MISSING_IMAGE_PATHS=$SKIP_MISSING_IMAGE_PATHS"
+if [ -n "$LLMSEG_IMAGE_PATH_REWRITE_FROM" ] || [ -n "$LLMSEG_IMAGE_PATH_REWRITE_TO" ]; then
+    echo "[INFO] IMAGE_PATH_REWRITE_FROM=$LLMSEG_IMAGE_PATH_REWRITE_FROM"
+    echo "[INFO] IMAGE_PATH_REWRITE_TO=$LLMSEG_IMAGE_PATH_REWRITE_TO"
+fi
+
+if [ "$CHECK_IMAGE_PATHS" = "1" ]; then
+    echo "[INFO] Checking train/valid image paths before launching GPUs..."
+    $PYTHON_EXE - <<'PY'
+import os
+import sys
+from pathlib import Path
+
+import pandas as pd
+
+rewrite_from = os.environ.get("LLMSEG_IMAGE_PATH_REWRITE_FROM", "").strip().rstrip("/\\")
+rewrite_to = os.environ.get("LLMSEG_IMAGE_PATH_REWRITE_TO", "").strip().rstrip("/\\")
+
+if bool(rewrite_from) ^ bool(rewrite_to):
+    print("[ERROR] Set both LLMSEG_IMAGE_PATH_REWRITE_FROM and LLMSEG_IMAGE_PATH_REWRITE_TO, or neither.")
+    sys.exit(1)
+
+
+def read_table(path: Path) -> pd.DataFrame:
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(path)
+    for encoding in ("utf-8-sig", "cp949", "euc-kr", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=encoding)
+        except UnicodeDecodeError:
+            continue
+    return pd.read_csv(path)
+
+
+def path_candidates(raw: str):
+    raw = raw.strip()
+    original = Path(raw)
+    if rewrite_from and rewrite_to:
+        if raw == rewrite_from:
+            raw = rewrite_to
+        elif raw.startswith(rewrite_from + "/") or raw.startswith(rewrite_from + "\\"):
+            suffix = raw[len(rewrite_from):].lstrip("/\\")
+            raw = f"{rewrite_to}/{suffix}"
+    rewritten = Path(raw)
+    if rewritten == original:
+        return [original]
+    return [rewritten, original]
+
+
+failed = False
+for label, table_path in (("TRAIN_CSV", Path(os.environ["TRAIN_CSV"])), ("VALID_CSV", Path(os.environ["VALID_CSV"]))):
+    if not table_path.exists():
+        print(f"[ERROR] {label} not found: {table_path}")
+        failed = True
+        continue
+
+    df = read_table(table_path)
+    if "image_path" not in df.columns:
+        print(f"[WARN] {label} has no image_path column; skipping image-path preflight.")
+        continue
+
+    values = df["image_path"].dropna().astype(str)
+    missing = []
+    missing_count = 0
+    used_original_count = 0
+    for raw in values:
+        candidates = path_candidates(raw)
+        existing = next((candidate for candidate in candidates if candidate.exists()), None)
+        if existing is None:
+            missing_count += 1
+            if len(missing) < 10:
+                missing.append((raw, [str(candidate) for candidate in candidates]))
+        elif len(candidates) > 1 and existing == candidates[1]:
+            used_original_count += 1
+
+    if missing_count:
+        if os.environ.get("LLMSEG_SKIP_MISSING_IMAGE_PATHS", "0") == "1":
+            print(f"[WARN] {label} will skip {missing_count}/{len(values)} missing image_path files.")
+        else:
+            failed = True
+            print(f"[ERROR] {label} missing {missing_count}/{len(values)} image_path files.")
+        for raw, candidates in missing:
+            print(f"  - raw={raw}")
+            for candidate in candidates:
+                print(f"    checked={candidate}")
+    else:
+        print(f"[CHECK] {label}: all {len(values)} image_path files exist.")
+    if used_original_count:
+        print(
+            f"[INFO] {label}: kept the original CSV path for "
+            f"{used_original_count} files missing from the rewrite destination."
+        )
+
+if failed:
+    print("[HINT] Mount/stage the image volume or set LLMSEG_IMAGE_PATH_REWRITE_FROM and LLMSEG_IMAGE_PATH_REWRITE_TO.")
+    print("[HINT] Set CHECK_IMAGE_PATHS=0 only if you intentionally want to bypass this guard.")
+    sys.exit(1)
+PY
+fi
+
+nvidia-smi || true
+
+PIDS=()
+
+wait_batch() {
+    local fail=0
+    local pid
+    for pid in "${PIDS[@]}"; do
+        if ! wait "$pid"; then
+            fail=1
+        fi
+    done
+    PIDS=()
+
+    if [ "$fail" -ne 0 ]; then
+        echo "[ERROR] At least one training job failed. Check logs in: $LOG_ROOT"
+        exit 1
+    fi
+}
+
+run_one() {
+    local exp_idx="$1"
+    local exp_name="$2"
+    local use_dicom="$3"
+    local use_context="$4"
+    local freeze_vision="$5"
+
+    local context_args
+    if [ "$use_context" = "True" ]; then
+        context_args=(--context --llm_repo "$LLM_REPO")
+    else
+        context_args=(--no-context)
+    fi
+    local dicom_args
+    if [ "$use_dicom" = "True" ]; then
+        dicom_args=(--use_dicom)
+    else
+        dicom_args=(--no-use_dicom)
+    fi
+    local freeze_args
+    if [ "$freeze_vision" = "True" ]; then
+        if [ -z "$PRETRAINED" ]; then
+            echo "[ERROR] $exp_name requires PRETRAINED for a frozen-vision phase."
+            return 1
+        fi
+        freeze_args=(--freeze_vision)
+    else
+        freeze_args=(--no-freeze_vision)
+    fi
+
+    local pretrained_args=()
+    if [ -n "$PRETRAINED" ]; then
+        pretrained_args=(--pretrained "$PRETRAINED")
+    fi
+
+    local slot=$((exp_idx % ${#GPU_PAIR_LIST[@]}))
+    local gpu_pair="${GPU_PAIR_LIST[$slot]}"
+    local port=$((BASE_PORT + exp_idx))
+    local checkpoint_dir="${CHECKPOINT_BASE}/${exp_name}"
+    local log_path="${LOG_ROOT}/${exp_name}.log"
+    local resume_args=()
+
+    if [ -f "${checkpoint_dir}/final_model.pth" ] && [ "$OVERWRITE_TRAIN" != "1" ]; then
+        echo "[SKIP] final_model.pth already exists: $checkpoint_dir"
+        return 0
+    fi
+    if [ "$AUTO_RESUME" = "1" ] && [ "$OVERWRITE_TRAIN" != "1" ]; then
+        local latest_resume
+        latest_resume="$(
+            find "$checkpoint_dir" -maxdepth 1 -type f -name 'model_epoch_*.pth' \
+                -printf '%f\n' 2>/dev/null | sort -V | tail -n 1
+        )"
+        if [ -n "$latest_resume" ]; then
+            resume_args=(--resume "${checkpoint_dir}/${latest_resume}")
+        fi
+    fi
+
+    mkdir -p "$checkpoint_dir"
+
+    {
+        echo "=========================================================="
+        echo "[START] Train: $exp_name"
+        echo "GPU pair          : $gpu_pair"
+        echo "main_process_port : $port"
+        echo "DICOM FiLM        : $use_dicom"
+        echo "Safe text         : $use_context"
+        echo "Freeze vision     : $freeze_vision"
+        echo "Checkpoint        : $checkpoint_dir"
+        echo "Resume            : ${resume_args[*]:-<none>}"
+        echo "=========================================================="
+
+        CUDA_VISIBLE_DEVICES="$gpu_pair" accelerate launch \
+            --num_processes 2 \
+            --num_machines 1 \
+            --mixed_precision "$MIXED_PRECISION_MODE" \
+            --main_process_port "$port" \
+            --dynamo_backend no \
+            train.py \
+            --mixed_precision "$MIXED_PRECISION_MODE" \
+            --patch_size $PATCH_SIZE \
+            --batch_size "$BATCH_SIZE" \
+            --grad_accum "$GRAD_ACCUM" \
+            --num_workers "$NUM_WORKERS" \
+            "${context_args[@]}" \
+            "${dicom_args[@]}" \
+            "${freeze_args[@]}" \
+            "${pretrained_args[@]}" \
+            "${resume_args[@]}" \
+            --checkpoint_dir "$checkpoint_dir" \
+            --experiment_name "$exp_name" \
+            --train_csv "$TRAIN_CSV" \
+            --valid_csv "$VALID_CSV" \
+            --epochs "$EPOCHS" \
+            --n_iter_per_epoch "$N_ITER_PER_EPOCH" \
+            --n_iter_valid "$N_ITER_VALID" \
+            --checkpoint_interval "$CHECKPOINT_INTERVAL" \
+            --positive_prob "$POSITIVE_PROB" \
+            --loss_fct "$LOSS_FCT" \
+            --include_clinical False \
+            --include_findings False \
+            --include_cc "$use_context" \
+            --include_chief_complaint "$use_context" \
+            --include_emr False \
+            --include_demographics False \
+            --dicom_prompt_mode none \
+            --cfg_scale "$CFG_SCALE"
+
+        echo "[DONE] Train: $exp_name"
+    } >"$log_path" 2>&1
+}
+
+for idx in "${!EXPERIMENTS[@]}"; do
+    IFS='|' read -r exp_name use_dicom use_context freeze_vision <<< "${EXPERIMENTS[$idx]}"
+
+    echo "=========================================================="
+    echo "[LAUNCH] $exp_name on GPU pair ${GPU_PAIR_LIST[$((idx % ${#GPU_PAIR_LIST[@]}))]}"
+    echo "Log: ${LOG_ROOT}/${exp_name}.log"
+    echo "=========================================================="
+
+    run_one "$idx" "$exp_name" "$use_dicom" "$use_context" "$freeze_vision" &
+    PIDS+=("$!")
+
+    if [ "${#PIDS[@]}" -ge "$MAX_PARALLEL" ]; then
+        wait_batch
+    fi
+done
+
+if [ "${#PIDS[@]}" -gt 0 ]; then
+    wait_batch
+fi
+
+echo "[DONE] DICOM training ablation completed. Logs: $LOG_ROOT"
