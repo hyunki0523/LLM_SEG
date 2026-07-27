@@ -128,22 +128,10 @@ export LLMSEG_IMAGE_PATH_REWRITE_FROM="$IMAGE_PATH_REWRITE_FROM"
 export LLMSEG_IMAGE_PATH_REWRITE_TO="$IMAGE_PATH_REWRITE_TO"
 
 echo "[INFO] Checking required Python packages..."
-$PYTHON_EXE - <<'PY' || {
-import importlib.util
-import sys
-
-missing = [name for name in ["nibabel"] if importlib.util.find_spec(name) is None]
-if missing:
-    print("[MISSING] " + " ".join(missing))
-    sys.exit(1)
-PY
+if ! "$PYTHON_EXE" -c 'import nibabel; print(f"[CHECK] nibabel={nibabel.__version__}")'; then
     $PYTHON_EXE -m pip install --quiet nibabel || $PYTHON_EXE -m pip install nibabel
-}
-
-$PYTHON_EXE - <<'PY'
-import nibabel
-print(f"[CHECK] nibabel={nibabel.__version__}")
-PY
+    "$PYTHON_EXE" -c 'import nibabel; print(f"[CHECK] nibabel={nibabel.__version__}")'
+fi
 
 echo "[INFO] Auditing multimodal data contract..."
 $PYTHON_EXE audit_dataset_contract.py \
@@ -171,96 +159,16 @@ fi
 
 if [ "$CHECK_IMAGE_PATHS" = "1" ]; then
     echo "[INFO] Checking train/valid image paths before launching GPUs..."
-    $PYTHON_EXE - <<'PY'
-import os
-import sys
-from pathlib import Path
-
-import pandas as pd
-
-rewrite_from = os.environ.get("LLMSEG_IMAGE_PATH_REWRITE_FROM", "").strip().rstrip("/\\")
-rewrite_to = os.environ.get("LLMSEG_IMAGE_PATH_REWRITE_TO", "").strip().rstrip("/\\")
-
-if bool(rewrite_from) ^ bool(rewrite_to):
-    print("[ERROR] Set both LLMSEG_IMAGE_PATH_REWRITE_FROM and LLMSEG_IMAGE_PATH_REWRITE_TO, or neither.")
-    sys.exit(1)
-
-
-def read_table(path: Path) -> pd.DataFrame:
-    if path.suffix.lower() in {".xlsx", ".xls"}:
-        return pd.read_excel(path)
-    for encoding in ("utf-8-sig", "cp949", "euc-kr", "latin-1"):
-        try:
-            return pd.read_csv(path, encoding=encoding)
-        except UnicodeDecodeError:
-            continue
-    return pd.read_csv(path)
-
-
-def path_candidates(raw: str):
-    raw = raw.strip()
-    original = Path(raw)
-    if rewrite_from and rewrite_to:
-        if raw == rewrite_from:
-            raw = rewrite_to
-        elif raw.startswith(rewrite_from + "/") or raw.startswith(rewrite_from + "\\"):
-            suffix = raw[len(rewrite_from):].lstrip("/\\")
-            raw = f"{rewrite_to}/{suffix}"
-    rewritten = Path(raw)
-    if rewritten == original:
-        return [original]
-    return [rewritten, original]
-
-
-failed = False
-for label, table_path in (("TRAIN_CSV", Path(os.environ["TRAIN_CSV"])), ("VALID_CSV", Path(os.environ["VALID_CSV"]))):
-    if not table_path.exists():
-        print(f"[ERROR] {label} not found: {table_path}")
-        failed = True
-        continue
-
-    df = read_table(table_path)
-    if "image_path" not in df.columns:
-        print(f"[WARN] {label} has no image_path column; skipping image-path preflight.")
-        continue
-
-    values = df["image_path"].dropna().astype(str)
-    missing = []
-    missing_count = 0
-    used_original_count = 0
-    for raw in values:
-        candidates = path_candidates(raw)
-        existing = next((candidate for candidate in candidates if candidate.exists()), None)
-        if existing is None:
-            missing_count += 1
-            if len(missing) < 10:
-                missing.append((raw, [str(candidate) for candidate in candidates]))
-        elif len(candidates) > 1 and existing == candidates[1]:
-            used_original_count += 1
-
-    if missing_count:
-        if os.environ.get("LLMSEG_SKIP_MISSING_IMAGE_PATHS", "0") == "1":
-            print(f"[WARN] {label} will skip {missing_count}/{len(values)} missing image_path files.")
-        else:
-            failed = True
-            print(f"[ERROR] {label} missing {missing_count}/{len(values)} image_path files.")
-        for raw, candidates in missing:
-            print(f"  - raw={raw}")
-            for candidate in candidates:
-                print(f"    checked={candidate}")
-    else:
-        print(f"[CHECK] {label}: all {len(values)} image_path files exist.")
-    if used_original_count:
-        print(
-            f"[INFO] {label}: kept the original CSV path for "
-            f"{used_original_count} files missing from the rewrite destination."
-        )
-
-if failed:
-    print("[HINT] Mount/stage the image volume or set LLMSEG_IMAGE_PATH_REWRITE_FROM and LLMSEG_IMAGE_PATH_REWRITE_TO.")
-    print("[HINT] Set CHECK_IMAGE_PATHS=0 only if you intentionally want to bypass this guard.")
-    sys.exit(1)
-PY
+    path_check_args=(
+        --train-csv "$TRAIN_CSV"
+        --valid-csv "$VALID_CSV"
+        --rewrite-from "$LLMSEG_IMAGE_PATH_REWRITE_FROM"
+        --rewrite-to "$LLMSEG_IMAGE_PATH_REWRITE_TO"
+    )
+    if [ "$SKIP_MISSING_IMAGE_PATHS" = "1" ]; then
+        path_check_args+=(--skip-missing)
+    fi
+    "$PYTHON_EXE" check_image_paths.py "${path_check_args[@]}"
 fi
 
 nvidia-smi || true
