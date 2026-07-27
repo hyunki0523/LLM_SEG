@@ -233,6 +233,10 @@ run_one() {
     local log_path="${LOG_ROOT}/${exp_name}.log"
     local resume_args=()
 
+    # The first run has no experiment directory yet. Create it before the
+    # auto-resume `find`; otherwise `set -euo pipefail` aborts before logging.
+    mkdir -p "$checkpoint_dir"
+
     if [ -f "${checkpoint_dir}/final_model.pth" ] && [ "$OVERWRITE_TRAIN" != "1" ]; then
         echo "[SKIP] final_model.pth already exists: $checkpoint_dir"
         return 0
@@ -247,8 +251,6 @@ run_one() {
             resume_args=(--resume "${checkpoint_dir}/${latest_resume}")
         fi
     fi
-
-    mkdir -p "$checkpoint_dir"
 
     {
         echo "=========================================================="
