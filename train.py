@@ -564,8 +564,16 @@ def main(args):
                 p.requires_grad_(False)
         model.text_encoder.eval()
 
+    print(
+        f"[PREPARE][rank={accelerator.process_index}] entering accelerator.prepare",
+        flush=True,
+    )
     model, optimizer, scheduler, train_dl, valid_dl = accelerator.prepare(
         model, optimizer, scheduler, train_dl, valid_dl
+    )
+    print(
+        f"[PREPARE][rank={accelerator.process_index}] accelerator.prepare complete",
+        flush=True,
     )
 
     # === [RESUME] Full state restoration (must be after accelerator.prepare) ===

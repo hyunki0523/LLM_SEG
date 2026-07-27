@@ -52,10 +52,17 @@ if [ "$SMOKE_TEST" = "1" ]; then
     export EPOCHS="${EPOCHS:-1}"
     export N_ITER_PER_EPOCH="${N_ITER_PER_EPOCH:-2}"
     export N_ITER_VALID="${N_ITER_VALID:-1}"
+    export BATCH_SIZE="${BATCH_SIZE:-1}"
+    export GRAD_ACCUM="${GRAD_ACCUM:-1}"
+    export NUM_WORKERS="${NUM_WORKERS:-2}"
     export CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-1}"
     export OVERWRITE_TRAIN="${OVERWRITE_TRAIN:-1}"
     export CHECKPOINT_BASE="${CHECKPOINT_BASE:-${PROJECT_DIR}/_debug_ckpt/llama_safe_fusion_2gpu}"
     export LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/llama_safe_fusion_2gpu_smoke_$(date +%Y%m%d_%H%M%S)}"
+    export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
+    export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
+    export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
+    export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
 fi
 
 echo "=========================================================="
