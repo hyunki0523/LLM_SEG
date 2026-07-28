@@ -2,9 +2,34 @@
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 from torch import nn
+
+
+def _stable_multihead_attention(module, query, key, value, **kwargs):
+    """Run only multimodal MHA in FP32 to avoid unstable BF16 batched GEMM."""
+    if os.environ.get("LLMSEG_FORCE_FP32_MHA", "0") != "1":
+        return module(query, key, value, **kwargs)
+
+    output_dtype = query.dtype
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        output, weights = module(
+            query.float(),
+            key.float(),
+            value.float(),
+            **kwargs,
+        )
+    return output.to(output_dtype), weights
+
+
+if os.environ.get("LLMSEG_FORCE_FP32_MHA", "0") == "1":
+    print(
+        "[INFO] Multimodal attention precision: FP32 "
+        "(LLMSEG_FORCE_FP32_MHA=1)"
+    )
 
 
 class DICOMMetadataEncoder(nn.Module):
@@ -122,7 +147,8 @@ class HybridConceptExtractor(nn.Module):
         # cudaErrorIllegalAddress for this variable-length BF16 path on sm_120.
         # The explicit attention-weight path uses stable matmul/softmax kernels;
         # the matrix is tiny here (concept queries x <=128 text tokens).
-        attended, weights = self.cross_attn(
+        attended, weights = _stable_multihead_attention(
+            self.cross_attn,
             queries,
             text_tokens,
             text_tokens,
@@ -183,7 +209,12 @@ class GroundedResidualFusion3D(nn.Module):
         # backend-dependent BF16 GEMM layout handling in MultiheadAttention.
         spatial = vision.flatten(2).transpose(1, 2).contiguous()
         concept_features = self.concept_proj(concepts).contiguous()
-        delta, _ = self.cross_attn(spatial, concept_features, concept_features)
+        delta, _ = _stable_multihead_attention(
+            self.cross_attn,
+            spatial,
+            concept_features,
+            concept_features,
+        )
         delta = self.residual_proj(self.norm(delta))
 
         pooled_vision = spatial.mean(dim=1)
