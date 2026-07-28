@@ -337,7 +337,7 @@ class STUNet(nn.Module):
                         # 1) device_map=None으로 설정하여 Accelerate의 CPU 고정 훅(hook)이 걸리지 않게 순수 CPU 메모리에 올립니다.
                         model = _load_auto_model(
                             repo,
-                            torch_dtype=torch.bfloat16,
+                            dtype=torch.bfloat16,
                             device_map=None, 
                             trust_remote_code=True,
                             low_cpu_mem_usage=True,

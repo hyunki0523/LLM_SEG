@@ -191,7 +191,15 @@ class GroundedResidualFusion3D(nn.Module):
                 -1, 1
             ).to(confidence.dtype)
         alpha = torch.sigmoid(self.logit_alpha)
-        effective_alpha = vision.new_ones(()) if force_full_strength else alpha
+        # Keep logit_alpha in the DDP autograd graph during forced-fusion
+        # warmup while holding the forward value exactly at 1.0. Replacing
+        # alpha with a newly-created constant made one parameter in every
+        # fusion scale unused and caused DDP reduction failures.
+        effective_alpha = (
+            vision.new_ones(()) + alpha * 0.0
+            if force_full_strength
+            else alpha
+        )
         if force_full_strength:
             effective_confidence = torch.ones_like(effective_confidence)
         residual = effective_alpha * effective_confidence.unsqueeze(1) * delta
