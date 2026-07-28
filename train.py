@@ -295,6 +295,15 @@ def make_context_tokens_batch(tokenizer, max_length, context_length, contexts, d
 def main(args):
     seed_everything()
 
+    detect_anomaly = os.environ.get("LLMSEG_DETECT_ANOMALY", "0") == "1"
+    torch.autograd.set_detect_anomaly(detect_anomaly)
+    if detect_anomaly:
+        print(
+            "[DEBUG] torch autograd anomaly detection enabled "
+            "(LLMSEG_DETECT_ANOMALY=1)",
+            flush=True,
+        )
+
     # 8-bit 양자화(BitsAndBytes) 모델의 커스텀 Autograd 훅은 static_graph=True와 충돌하여 내부 C++ 단언(Assert) 에러를 냅니다.
     # 하지만 이제 쓰지 않는 파라미터들(seg_outputs)을 앞에서 미리 동결(requires_grad=False)해두었으므로,
     # find_unused_parameters=False를 설정해도 완벽히 동작하며 메모리 누수도 잡을 수 있습니다!

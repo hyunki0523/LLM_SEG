@@ -106,7 +106,14 @@ class HybridConceptExtractor(nn.Module):
         self.norm2 = nn.LayerNorm(text_dim)
 
     def forward(self, text_tokens, attention_mask=None):
-        queries = self.queries.expand(text_tokens.shape[0], -1, -1)
+        # expand() creates a stride-0 batch dimension. Materialize it before
+        # BF16 GEMM/MHA: the cu132 Blackwell stack has produced
+        # CUBLAS_STATUS_INTERNAL_ERROR in backward for batch sizes > 1 when
+        # this view reaches the attention projections.
+        queries = self.queries.expand(
+            text_tokens.shape[0], -1, -1
+        ).contiguous()
+        text_tokens = text_tokens.contiguous()
         key_padding_mask = None
         if attention_mask is not None:
             key_padding_mask = ~attention_mask.bool()
@@ -172,8 +179,10 @@ class GroundedResidualFusion3D(nn.Module):
             return vision, {"confidence": zero, "residual_rms": zero}
 
         batch, channels, depth, height, width = vision.shape
-        spatial = vision.flatten(2).transpose(1, 2)
-        concept_features = self.concept_proj(concepts)
+        # transpose() is non-contiguous. Explicit materialization avoids
+        # backend-dependent BF16 GEMM layout handling in MultiheadAttention.
+        spatial = vision.flatten(2).transpose(1, 2).contiguous()
+        concept_features = self.concept_proj(concepts).contiguous()
         delta, _ = self.cross_attn(spatial, concept_features, concept_features)
         delta = self.residual_proj(self.norm(delta))
 
