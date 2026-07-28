@@ -36,6 +36,30 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+
+def _configure_cuda_sdp_backends():
+    """Use the stable math SDP backend when requested by the launcher."""
+    if os.environ.get("LLMSEG_FORCE_MATH_SDP", "0") != "1":
+        return
+    cuda_backends = getattr(torch.backends, "cuda", None)
+    if cuda_backends is None:
+        return
+    for setter_name, enabled in (
+        ("enable_flash_sdp", False),
+        ("enable_mem_efficient_sdp", False),
+        ("enable_math_sdp", True),
+    ):
+        setter = getattr(cuda_backends, setter_name, None)
+        if setter is not None:
+            setter(enabled)
+    print(
+        "[INFO] CUDA SDP backends: flash=off, mem_efficient=off, math=on "
+        "(LLMSEG_FORCE_MATH_SDP=1)"
+    )
+
+
+_configure_cuda_sdp_backends()
+
 from monai.networks.blocks import UnetrBasicBlock
 from monai.utils import ensure_tuple_rep
 
@@ -63,11 +87,21 @@ def _load_auto_model(repo, **kwargs):
     attn_impl = os.environ.get("LLM_ATTN_IMPLEMENTATION", "sdpa").strip()
     if attn_impl:
         try:
-            return AutoModel.from_pretrained(
+            model = AutoModel.from_pretrained(
                 repo,
                 attn_implementation=attn_impl,
                 **kwargs,
             )
+            configured_impl = getattr(
+                model.config,
+                "_attn_implementation",
+                getattr(model.config, "attn_implementation", "<unknown>"),
+            )
+            print(
+                f"[INFO] LLM attention: requested={attn_impl}, "
+                f"configured={configured_impl}"
+            )
+            return model
         except (TypeError, ValueError) as e:
             if "attn" not in str(e).lower():
                 raise

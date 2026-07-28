@@ -63,6 +63,10 @@ if [ "$SMOKE_TEST" = "1" ]; then
     export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
     export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-DETAIL}"
     export TORCH_NCCL_ASYNC_ERROR_HANDLING="${TORCH_NCCL_ASYNC_ERROR_HANDLING:-1}"
+    # Smoke runs prioritize a trustworthy traceback over throughput. Without
+    # this, an asynchronous kernel fault is commonly reported later at an
+    # unrelated tensor .to() call.
+    export CUDA_LAUNCH_BLOCKING="${CUDA_LAUNCH_BLOCKING:-1}"
 fi
 
 echo "=========================================================="
@@ -72,6 +76,7 @@ echo "Experiments       : $EXPERIMENTS_2GPU"
 echo "Smoke test        : $SMOKE_TEST"
 echo "Base launcher     : $BASE_LAUNCHER"
 echo "PRETRAINED        : ${PRETRAINED:-<none>}"
+echo "CUDA blocking     : ${CUDA_LAUNCH_BLOCKING:-0}"
 echo "=========================================================="
 
 exec bash "$BASE_LAUNCHER"

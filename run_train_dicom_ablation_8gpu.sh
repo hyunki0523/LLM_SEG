@@ -127,6 +127,11 @@ export LLMSEG_DISABLE_TORCHAUDIO="${LLMSEG_DISABLE_TORCHAUDIO:-1}"
 # attention is slower but stable; callers can explicitly override this after
 # validating another backend on their installed Torch/CUDA stack.
 export LLM_ATTN_IMPLEMENTATION="${LLM_ATTN_IMPLEMENTATION:-eager}"
+# The grounded concept branch uses torch.nn.MultiheadAttention independently
+# of the Hugging Face Llama attention implementation. Disable fused
+# flash/memory-efficient SDPA there as well on the current Torch 2.12/cu132
+# Blackwell stack.
+export LLMSEG_FORCE_MATH_SDP="${LLMSEG_FORCE_MATH_SDP:-1}"
 export TRAIN_CSV VALID_CSV
 export LLMSEG_SKIP_MISSING_IMAGE_PATHS="$SKIP_MISSING_IMAGE_PATHS"
 export LLMSEG_IMAGE_PATH_REWRITE_FROM="$IMAGE_PATH_REWRITE_FROM"
@@ -156,6 +161,7 @@ echo "[INFO] RUN_EXTRA_MODES=$RUN_EXTRA_MODES"
 echo "[INFO] ONLY_EXPERIMENTS=${ONLY_EXPERIMENTS:-<all>}"
 echo "[INFO] AUTO_RESUME=$AUTO_RESUME"
 echo "[INFO] LLM_ATTN_IMPLEMENTATION=$LLM_ATTN_IMPLEMENTATION"
+echo "[INFO] LLMSEG_FORCE_MATH_SDP=$LLMSEG_FORCE_MATH_SDP"
 echo "[INFO] CHECK_IMAGE_PATHS=$CHECK_IMAGE_PATHS"
 echo "[INFO] SKIP_MISSING_IMAGE_PATHS=$SKIP_MISSING_IMAGE_PATHS"
 if [ -n "$LLMSEG_IMAGE_PATH_REWRITE_FROM" ] || [ -n "$LLMSEG_IMAGE_PATH_REWRITE_TO" ]; then

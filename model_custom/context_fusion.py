@@ -110,16 +110,24 @@ class HybridConceptExtractor(nn.Module):
         key_padding_mask = None
         if attention_mask is not None:
             key_padding_mask = ~attention_mask.bool()
+        # need_weights=False dispatches through fused SDPA in recent PyTorch
+        # releases. Torch 2.12/cu132 intermittently raises
+        # cudaErrorIllegalAddress for this variable-length BF16 path on sm_120.
+        # The explicit attention-weight path uses stable matmul/softmax kernels;
+        # the matrix is tiny here (concept queries x <=128 text tokens).
         attended, weights = self.cross_attn(
             queries,
             text_tokens,
             text_tokens,
             key_padding_mask=key_padding_mask,
-            need_weights=not self.training,
+            need_weights=True,
             average_attn_weights=False,
         )
         concepts = self.norm1(queries + attended)
         concepts = self.norm2(concepts + self.ffn(concepts))
+        if self.training:
+            # Do not keep the diagnostic attention matrix in context_aux.
+            weights = None
         return concepts, weights
 
 
