@@ -192,6 +192,8 @@ class STUNet(nn.Module):
         dicom_numeric_dim: int = 10,
         dicom_category_sizes=(2, 2),
         dicom_embedding_dim: int = 256,
+        context_initial_alpha: float = 0.10,
+        context_min_alpha: float = 0.05,
     ):
         super().__init__()
         self.conv_op = nn.Conv3d
@@ -501,7 +503,13 @@ class STUNet(nn.Module):
             decoder_dims = list(reversed(dims[:-1]))
             self.context_fusions = nn.ModuleList(
                 [
-                    GroundedResidualFusion3D(C, token_embed_dim, num_heads=8)
+                    GroundedResidualFusion3D(
+                        C,
+                        token_embed_dim,
+                        num_heads=8,
+                        initial_alpha=context_initial_alpha,
+                        min_alpha=context_min_alpha,
+                    )
                     for C in decoder_dims[:3]
                 ]
             )
@@ -537,7 +545,7 @@ class STUNet(nn.Module):
         cfg_scale=1.0,
         return_cls: bool = False,
         return_context_variants: bool = False,
-        force_text_fusion: bool = False,
+        text_fusion_force_strength: float = 0.0,
         context_patch_mask_probability: float = 0.0,
         context_hard_bypass_threshold: float = 0.0,
     ):
@@ -566,7 +574,7 @@ class STUNet(nn.Module):
                 dicom_categorical,
                 force_drop_text=False,
                 return_cls=return_cls,
-                force_text_fusion=force_text_fusion,
+                text_fusion_force_strength=text_fusion_force_strength,
             )
             raw_fused, cls_logits = raw_result if return_cls else (raw_result, None)
             saved_context_aux = self.context_aux
@@ -579,7 +587,7 @@ class STUNet(nn.Module):
                 dicom_categorical,
                 force_drop_text=True,
                 return_cls=return_cls,
-                force_text_fusion=False,
+                text_fusion_force_strength=0.0,
             )
             vision_logits, vision_cls_logits = (
                 vision_result if return_cls else (vision_result, None)
@@ -668,7 +676,7 @@ class STUNet(nn.Module):
             dicom_categorical,
             force_drop_text=False,
             return_cls=return_cls,
-            force_text_fusion=force_text_fusion,
+            text_fusion_force_strength=text_fusion_force_strength,
         )
 
     def _forward_impl(
@@ -680,7 +688,7 @@ class STUNet(nn.Module):
         dicom_categorical=None,
         force_drop_text=False,
         return_cls: bool = False,
-        force_text_fusion: bool = False,
+        text_fusion_force_strength: float = 0.0,
     ):
             skips = []
             seg_outputs = []
@@ -759,7 +767,7 @@ class STUNet(nn.Module):
                         x,
                         concepts,
                         sample_gate=context_keep,
-                        force_full_strength=force_text_fusion,
+                        force_strength=text_fusion_force_strength,
                     )
                     self.context_aux[f"fusion_{u}"] = fusion_stats
                 
@@ -919,6 +927,8 @@ def get_stunet_small(
     use_dicom: bool = False,
     dicom_numeric_dim: int = 10,
     dicom_category_sizes=(2, 2),
+    context_initial_alpha: float = 0.10,
+    context_min_alpha: float = 0.05,
 ):
     kernel_sizes = [[3, 3, 3]] * 6
     if len(strides) > 5:
@@ -942,6 +952,8 @@ def get_stunet_small(
         use_dicom=use_dicom,
         dicom_numeric_dim=dicom_numeric_dim,
         dicom_category_sizes=dicom_category_sizes,
+        context_initial_alpha=context_initial_alpha,
+        context_min_alpha=context_min_alpha,
     )
 
 
@@ -958,6 +970,8 @@ def get_stunet_base(
     use_dicom: bool = False,
     dicom_numeric_dim: int = 10,
     dicom_category_sizes=(2, 2),
+    context_initial_alpha: float = 0.10,
+    context_min_alpha: float = 0.05,
 ):
     kernel_sizes = [[3, 3, 3]] * 6
     if len(strides) > 5:
@@ -981,6 +995,8 @@ def get_stunet_base(
         use_dicom=use_dicom,
         dicom_numeric_dim=dicom_numeric_dim,
         dicom_category_sizes=dicom_category_sizes,
+        context_initial_alpha=context_initial_alpha,
+        context_min_alpha=context_min_alpha,
     )
 
 
@@ -997,6 +1013,8 @@ def get_stunet_large(
     use_dicom: bool = False,
     dicom_numeric_dim: int = 10,
     dicom_category_sizes=(2, 2),
+    context_initial_alpha: float = 0.10,
+    context_min_alpha: float = 0.05,
 ):
     kernel_sizes = [[3, 3, 3]] * 6
     if len(strides) > 5:
@@ -1020,4 +1038,6 @@ def get_stunet_large(
         use_dicom=use_dicom,
         dicom_numeric_dim=dicom_numeric_dim,
         dicom_category_sizes=dicom_category_sizes,
+        context_initial_alpha=context_initial_alpha,
+        context_min_alpha=context_min_alpha,
     )

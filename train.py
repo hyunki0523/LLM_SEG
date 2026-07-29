@@ -180,8 +180,16 @@ def get_args_parser():
     parser.add_argument('--text_burden_weight', default=0.1, type=float)
     parser.add_argument('--text_trauma_weight', default=0.05, type=float)
     parser.add_argument('--compatibility_margin', default=0.2, type=float)
-    parser.add_argument('--text_fusion_warmup_epochs', default=5, type=int,
-                        help='Force text residual strength during the initial grounding phase.')
+    parser.add_argument('--text_fusion_warmup_epochs', default=30, type=int,
+                        help='Keep text residual strength at 1 during initial grounding.')
+    parser.add_argument('--text_fusion_transition_epochs', default=30, type=int,
+                        help='Epochs used to anneal forced text fusion from 1 to learned alpha.')
+    parser.add_argument('--context_initial_alpha', default=0.10, type=float,
+                        help='Initial learned text-residual strength after forced fusion.')
+    parser.add_argument('--context_min_alpha', default=0.05, type=float,
+                        help='Differentiable lower bound for learned text-residual strength.')
+    parser.add_argument('--raw_fused_seg_weight', default=0.5, type=float,
+                        help='Direct segmentation loss weight for the masked text-conditioned pass.')
     parser.add_argument('--context_patch_mask_probability', default=0.15, type=float,
                         help='Coarse vision-patch masking probability for the text-conditioned pass.')
     parser.add_argument('--context_hard_bypass_threshold', default=0.5, type=float,
@@ -294,6 +302,16 @@ def make_context_tokens_batch(tokenizer, max_length, context_length, contexts, d
 
 def main(args):
     seed_everything()
+    if args.text_fusion_warmup_epochs < 0:
+        raise ValueError("--text_fusion_warmup_epochs must be non-negative.")
+    if args.text_fusion_transition_epochs < 0:
+        raise ValueError("--text_fusion_transition_epochs must be non-negative.")
+    if not 0.0 <= args.context_min_alpha < args.context_initial_alpha < 1.0:
+        raise ValueError(
+            "Expected 0 <= --context_min_alpha < --context_initial_alpha < 1."
+        )
+    if args.raw_fused_seg_weight < 0.0:
+        raise ValueError("--raw_fused_seg_weight must be non-negative.")
 
     detect_anomaly = os.environ.get("LLMSEG_DETECT_ANOMALY", "0") == "1"
     torch.autograd.set_detect_anomaly(detect_anomaly)
@@ -326,8 +344,10 @@ def main(args):
         run_name += f"_{args.experiment_name}"
     if args.use_ema:
         run_name += "_EMA"
-    if not getattr(args, 'include_emr', True):
-        run_name += "_DICOMonly"
+    if args.context:
+        run_name += "_SafeCC"
+    if args.use_dicom:
+        run_name += "_DICOMFiLM"
     
     my_custom_config = {
         "learning_rate": getattr(args, 'lr', 'unknown'),
@@ -350,6 +370,11 @@ def main(args):
         "include_emr": getattr(args, 'include_emr', True),
         "include_demographics": getattr(args, 'include_demographics', True),
         "dicom_prompt_mode": getattr(args, 'dicom_prompt_mode', 'full'),
+        "text_fusion_warmup_epochs": args.text_fusion_warmup_epochs,
+        "text_fusion_transition_epochs": args.text_fusion_transition_epochs,
+        "context_initial_alpha": args.context_initial_alpha,
+        "context_min_alpha": args.context_min_alpha,
+        "raw_fused_seg_weight": args.raw_fused_seg_weight,
         "memo": "자동생성된 실험 설정 로그"
     }
 
@@ -447,6 +472,8 @@ def main(args):
         use_dicom=getattr(args, 'use_dicom', False),
         dicom_numeric_dim=10,
         dicom_category_sizes=dicom_category_sizes,
+        context_initial_alpha=args.context_initial_alpha,
+        context_min_alpha=args.context_min_alpha,
      )
     accelerator.print('parameters(trainable):', count_params(model))
 
@@ -684,6 +711,21 @@ def main(args):
         
         accelerator.print(f"{phase_str}Epoch {epoch}")
         model.train()
+        if epoch <= args.text_fusion_warmup_epochs:
+            text_fusion_force_strength = 1.0
+        elif args.text_fusion_transition_epochs > 0:
+            transition_progress = (
+                epoch - args.text_fusion_warmup_epochs
+            ) / args.text_fusion_transition_epochs
+            text_fusion_force_strength = max(0.0, 1.0 - transition_progress)
+        else:
+            text_fusion_force_strength = 0.0
+        if args.context:
+            accelerator.print(
+                "[TEXT FUSION] "
+                f"force_strength={text_fusion_force_strength:.4f}, "
+                f"learned_alpha_floor={args.context_min_alpha:.4f}"
+            )
         epoch_train_loss = []
         base_model = accelerator.unwrap_model(model)
         if args.context and hasattr(base_model, "text_encoder") and base_model.text_encoder is not None:
@@ -746,9 +788,7 @@ def main(args):
                             dicom_categorical=dicom_categorical,
                             return_cls=return_cls,
                             return_context_variants=args.safe_context_training,
-                            force_text_fusion=(
-                                epoch <= args.text_fusion_warmup_epochs
-                            ),
+                            text_fusion_force_strength=text_fusion_force_strength,
                             context_patch_mask_probability=args.context_patch_mask_probability,
                             context_hard_bypass_threshold=args.context_hard_bypass_threshold,
                         )
@@ -819,6 +859,21 @@ def main(args):
                             )
                         loss = loss + args.vision_seg_weight * vision_seg_loss
                         auxiliary_losses["vision_seg"] = vision_seg_loss
+
+                        if raw_fused_seg_logits is not None:
+                            if args.loss_fct in ['dice', 'dice_focal', 'tversky', 'gdfl']:
+                                raw_fused_seg_loss = loss_fct(
+                                    raw_fused_seg_logits.float(), mask_resized
+                                )
+                            else:
+                                raw_fused_seg_loss = loss_fct(
+                                    raw_fused_seg_logits.float(), target_bin
+                                )
+                            loss = (
+                                loss
+                                + args.raw_fused_seg_weight * raw_fused_seg_loss
+                            )
+                            auxiliary_losses["raw_fused_seg"] = raw_fused_seg_loss
 
                         if vision_seg_logits.shape[1] == 1:
                             vision_probability = torch.sigmoid(vision_seg_logits.float())

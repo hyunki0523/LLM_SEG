@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import os
 
 import torch
@@ -167,8 +168,23 @@ class HybridConceptExtractor(nn.Module):
 class GroundedResidualFusion3D(nn.Module):
     """Inject concepts as a small, confidence-controlled spatial residual."""
 
-    def __init__(self, channels: int, text_dim: int, num_heads: int = 8):
+    def __init__(
+        self,
+        channels: int,
+        text_dim: int,
+        num_heads: int = 8,
+        initial_alpha: float = 0.10,
+        min_alpha: float = 0.05,
+    ):
         super().__init__()
+        if not 0.0 <= min_alpha < 1.0:
+            raise ValueError(f"min_alpha must be in [0, 1), got {min_alpha}.")
+        if not min_alpha < initial_alpha < 1.0:
+            raise ValueError(
+                "initial_alpha must be greater than min_alpha and less than 1, "
+                f"got initial_alpha={initial_alpha}, min_alpha={min_alpha}."
+            )
+        self.min_alpha = float(min_alpha)
         self.concept_proj = nn.Sequential(
             nn.LayerNorm(text_dim),
             nn.Linear(text_dim, channels),
@@ -188,8 +204,11 @@ class GroundedResidualFusion3D(nn.Module):
         nn.init.zeros_(self.compatibility[-1].weight)
         nn.init.zeros_(self.compatibility[-1].bias)
 
-        # A small non-zero start preserves gradients without perturbing vision much.
-        self.logit_alpha = nn.Parameter(torch.tensor(-4.59511985))  # sigmoid=0.01
+        # Parameterize the learnable component above a non-zero floor. A clamp
+        # would stop gradients once alpha fell below the floor.
+        normalized_alpha = (initial_alpha - min_alpha) / (1.0 - min_alpha)
+        initial_logit = math.log(normalized_alpha / (1.0 - normalized_alpha))
+        self.logit_alpha = nn.Parameter(torch.tensor(initial_logit))
         self.norm = nn.LayerNorm(channels)
 
     def forward(
@@ -198,7 +217,7 @@ class GroundedResidualFusion3D(nn.Module):
         concepts,
         enabled=True,
         sample_gate=None,
-        force_full_strength: bool = False,
+        force_strength: float = 0.0,
     ):
         if not enabled or concepts is None:
             zero = vision.new_zeros(())
@@ -238,18 +257,18 @@ class GroundedResidualFusion3D(nn.Module):
             effective_confidence = effective_confidence * sample_gate.reshape(
                 -1, 1
             ).to(confidence.dtype)
-        alpha = torch.sigmoid(self.logit_alpha)
-        # Keep logit_alpha in the DDP autograd graph during forced-fusion
-        # warmup while holding the forward value exactly at 1.0. Replacing
-        # alpha with a newly-created constant made one parameter in every
-        # fusion scale unused and caused DDP reduction failures.
-        effective_alpha = (
-            vision.new_ones(()) + alpha * 0.0
-            if force_full_strength
-            else alpha
+        learned_alpha = self.min_alpha + (1.0 - self.min_alpha) * torch.sigmoid(
+            self.logit_alpha
         )
-        if force_full_strength:
-            effective_confidence = torch.ones_like(effective_confidence)
+        # Blend out forced fusion gradually. This keeps logit_alpha and the
+        # compatibility head in the DDP graph at every stage and avoids the
+        # previous 1.0 -> 0.01 discontinuity after a short warmup.
+        force_strength = float(max(0.0, min(1.0, force_strength)))
+        force = learned_alpha.new_tensor(force_strength)
+        effective_alpha = force + (1.0 - force) * learned_alpha
+        effective_confidence = (
+            force + (1.0 - force) * effective_confidence
+        )
         residual = effective_alpha * effective_confidence.unsqueeze(1) * delta
         fused = spatial + residual
         fused = fused.transpose(1, 2).reshape(batch, channels, depth, height, width)
@@ -258,6 +277,8 @@ class GroundedResidualFusion3D(nn.Module):
             "confidence_vector": confidence.squeeze(-1),
             "shuffled_confidence_vector": shuffled_confidence.squeeze(-1),
             "residual_rms": residual.float().square().mean().sqrt(),
+            "learned_alpha": learned_alpha,
             "effective_alpha": effective_alpha,
+            "force_strength": force,
         }
         return fused, stats

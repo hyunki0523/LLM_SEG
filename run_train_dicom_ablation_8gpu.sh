@@ -21,8 +21,8 @@ fi
 
 TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
-CHECKPOINT_BASE="${CHECKPOINT_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v1}"
-LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/llama_safe_film_context_v1_$(date +%Y%m%d_%H%M%S)}"
+CHECKPOINT_BASE="${CHECKPOINT_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v2}"
+LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/llama_safe_film_context_v2_$(date +%Y%m%d_%H%M%S)}"
 
 # The hk copy currently contains only Llama config/tokenizer/index files.
 # Reuse the complete read-only weight directory from jhk unless LLM_REPO is overridden.
@@ -40,6 +40,11 @@ LOSS_FCT="${LOSS_FCT:-tversky}"
 MIXED_PRECISION_MODE="${MIXED_PRECISION_MODE:-bf16}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 NUM_WORKERS="${NUM_WORKERS:-6}"
+TEXT_FUSION_WARMUP_EPOCHS="${TEXT_FUSION_WARMUP_EPOCHS:-30}"
+TEXT_FUSION_TRANSITION_EPOCHS="${TEXT_FUSION_TRANSITION_EPOCHS:-30}"
+CONTEXT_INITIAL_ALPHA="${CONTEXT_INITIAL_ALPHA:-0.10}"
+CONTEXT_MIN_ALPHA="${CONTEXT_MIN_ALPHA:-0.05}"
+RAW_FUSED_SEG_WEIGHT="${RAW_FUSED_SEG_WEIGHT:-0.5}"
 CFG_SCALE=1
 BASE_PORT="${BASE_PORT:-29600}"
 CHECK_IMAGE_PATHS="${CHECK_IMAGE_PATHS:-1}"
@@ -164,6 +169,11 @@ echo "[INFO] MAX_PARALLEL=$MAX_PARALLEL"
 echo "[INFO] RUN_EXTRA_MODES=$RUN_EXTRA_MODES"
 echo "[INFO] ONLY_EXPERIMENTS=${ONLY_EXPERIMENTS:-<all>}"
 echo "[INFO] AUTO_RESUME=$AUTO_RESUME"
+echo "[INFO] TEXT_FUSION_WARMUP_EPOCHS=$TEXT_FUSION_WARMUP_EPOCHS"
+echo "[INFO] TEXT_FUSION_TRANSITION_EPOCHS=$TEXT_FUSION_TRANSITION_EPOCHS"
+echo "[INFO] CONTEXT_INITIAL_ALPHA=$CONTEXT_INITIAL_ALPHA"
+echo "[INFO] CONTEXT_MIN_ALPHA=$CONTEXT_MIN_ALPHA"
+echo "[INFO] RAW_FUSED_SEG_WEIGHT=$RAW_FUSED_SEG_WEIGHT"
 echo "[INFO] LLM_ATTN_IMPLEMENTATION=$LLM_ATTN_IMPLEMENTATION"
 echo "[INFO] LLMSEG_FORCE_MATH_SDP=$LLMSEG_FORCE_MATH_SDP"
 echo "[INFO] LLMSEG_FORCE_FP32_MHA=$LLMSEG_FORCE_FP32_MHA"
@@ -308,6 +318,11 @@ run_one() {
             --checkpoint_interval "$CHECKPOINT_INTERVAL" \
             --positive_prob "$POSITIVE_PROB" \
             --loss_fct "$LOSS_FCT" \
+            --text_fusion_warmup_epochs "$TEXT_FUSION_WARMUP_EPOCHS" \
+            --text_fusion_transition_epochs "$TEXT_FUSION_TRANSITION_EPOCHS" \
+            --context_initial_alpha "$CONTEXT_INITIAL_ALPHA" \
+            --context_min_alpha "$CONTEXT_MIN_ALPHA" \
+            --raw_fused_seg_weight "$RAW_FUSED_SEG_WEIGHT" \
             --include_clinical False \
             --include_findings False \
             --include_cc "$use_context" \
