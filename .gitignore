@@ -24,6 +24,7 @@ model_custom/qwen3/Qwen3-8B-Base/
 
 # Training and evaluation outputs
 train_logs/
+text_feature_cache/
 inference_logs/
 inference_result/
 metric_results/

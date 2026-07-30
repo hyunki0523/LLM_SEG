@@ -45,6 +45,9 @@ TEXT_FUSION_TRANSITION_EPOCHS="${TEXT_FUSION_TRANSITION_EPOCHS:-30}"
 CONTEXT_INITIAL_ALPHA="${CONTEXT_INITIAL_ALPHA:-0.10}"
 CONTEXT_MIN_ALPHA="${CONTEXT_MIN_ALPHA:-0.05}"
 RAW_FUSED_SEG_WEIGHT="${RAW_FUSED_SEG_WEIGHT:-0.5}"
+SOFT_PROMPT_MODE="${SOFT_PROMPT_MODE:-learned}"
+TEXT_FEATURE_CACHE="${TEXT_FEATURE_CACHE:-}"
+EXPERIMENT_NAME_SUFFIX="${EXPERIMENT_NAME_SUFFIX:-}"
 CFG_SCALE=1
 BASE_PORT="${BASE_PORT:-29600}"
 CHECK_IMAGE_PATHS="${CHECK_IMAGE_PATHS:-1}"
@@ -99,7 +102,7 @@ fi
 NEEDS_LLM=0
 for experiment in "${EXPERIMENTS[@]}"; do
     IFS='|' read -r check_name check_dicom check_context check_freeze <<< "$experiment"
-    if [ "$check_context" = "True" ]; then
+    if [ "$check_context" = "True" ] && [ -z "$TEXT_FEATURE_CACHE" ]; then
         NEEDS_LLM=1
         break
     fi
@@ -112,6 +115,16 @@ if [ "$NEEDS_LLM" = "1" ]; then
     if ! compgen -G "${LLM_REPO%/}/model-*.safetensors" > /dev/null \
        && ! compgen -G "${LLM_REPO%/}/pytorch_model-*.bin" > /dev/null; then
         echo "[ERROR] Llama weight shards not found under: $LLM_REPO"
+        exit 1
+    fi
+fi
+if [ -n "$TEXT_FEATURE_CACHE" ]; then
+    if [ "$SOFT_PROMPT_MODE" != "disabled" ]; then
+        echo "[ERROR] TEXT_FEATURE_CACHE requires SOFT_PROMPT_MODE=disabled"
+        exit 1
+    fi
+    if [ ! -f "$TEXT_FEATURE_CACHE" ]; then
+        echo "[ERROR] Text feature cache not found: $TEXT_FEATURE_CACHE"
         exit 1
     fi
 fi
@@ -174,6 +187,9 @@ echo "[INFO] TEXT_FUSION_TRANSITION_EPOCHS=$TEXT_FUSION_TRANSITION_EPOCHS"
 echo "[INFO] CONTEXT_INITIAL_ALPHA=$CONTEXT_INITIAL_ALPHA"
 echo "[INFO] CONTEXT_MIN_ALPHA=$CONTEXT_MIN_ALPHA"
 echo "[INFO] RAW_FUSED_SEG_WEIGHT=$RAW_FUSED_SEG_WEIGHT"
+echo "[INFO] SOFT_PROMPT_MODE=$SOFT_PROMPT_MODE"
+echo "[INFO] TEXT_FEATURE_CACHE=${TEXT_FEATURE_CACHE:-<online>}"
+echo "[INFO] EXPERIMENT_NAME_SUFFIX=${EXPERIMENT_NAME_SUFFIX:-<none>}"
 echo "[INFO] LLM_ATTN_IMPLEMENTATION=$LLM_ATTN_IMPLEMENTATION"
 echo "[INFO] LLMSEG_FORCE_MATH_SDP=$LLMSEG_FORCE_MATH_SDP"
 echo "[INFO] LLMSEG_FORCE_FP32_MHA=$LLMSEG_FORCE_FP32_MHA"
@@ -225,9 +241,17 @@ run_one() {
     local use_context="$4"
     local freeze_vision="$5"
 
+    local effective_name="${exp_name}${EXPERIMENT_NAME_SUFFIX}"
     local context_args
     if [ "$use_context" = "True" ]; then
-        context_args=(--context --llm_repo "$LLM_REPO")
+        context_args=(
+            --context
+            --llm_repo "$LLM_REPO"
+            --soft_prompt_mode "$SOFT_PROMPT_MODE"
+        )
+        if [ -n "$TEXT_FEATURE_CACHE" ]; then
+            context_args+=(--text_feature_cache "$TEXT_FEATURE_CACHE")
+        fi
     else
         context_args=(--no-context)
     fi
@@ -256,8 +280,8 @@ run_one() {
     local slot=$((exp_idx % ${#GPU_PAIR_LIST[@]}))
     local gpu_pair="${GPU_PAIR_LIST[$slot]}"
     local port=$((BASE_PORT + exp_idx))
-    local checkpoint_dir="${CHECKPOINT_BASE}/${exp_name}"
-    local log_path="${LOG_ROOT}/${exp_name}.log"
+    local checkpoint_dir="${CHECKPOINT_BASE}/${effective_name}"
+    local log_path="${LOG_ROOT}/${effective_name}.log"
     local resume_args=()
 
     # The first run has no experiment directory yet. Create it before the
@@ -281,11 +305,13 @@ run_one() {
 
     {
         echo "=========================================================="
-        echo "[START] Train: $exp_name"
+        echo "[START] Train: $effective_name"
         echo "GPU pair          : $gpu_pair"
         echo "main_process_port : $port"
         echo "DICOM FiLM        : $use_dicom"
         echo "Safe text         : $use_context"
+        echo "Soft prompt       : $SOFT_PROMPT_MODE"
+        echo "Text cache        : ${TEXT_FEATURE_CACHE:-<online>}"
         echo "Freeze vision     : $freeze_vision"
         echo "Checkpoint        : $checkpoint_dir"
         echo "Resume            : ${resume_args[*]:-<none>}"
@@ -309,7 +335,7 @@ run_one() {
             "${pretrained_args[@]}" \
             "${resume_args[@]}" \
             --checkpoint_dir "$checkpoint_dir" \
-            --experiment_name "$exp_name" \
+            --experiment_name "$effective_name" \
             --train_csv "$TRAIN_CSV" \
             --valid_csv "$VALID_CSV" \
             --epochs "$EPOCHS" \
@@ -332,7 +358,7 @@ run_one() {
             --dicom_prompt_mode none \
             --cfg_scale "$CFG_SCALE"
 
-        echo "[DONE] Train: $exp_name"
+        echo "[DONE] Train: $effective_name"
     } >"$log_path" 2>&1
 }
 
@@ -340,8 +366,9 @@ for idx in "${!EXPERIMENTS[@]}"; do
     IFS='|' read -r exp_name use_dicom use_context freeze_vision <<< "${EXPERIMENTS[$idx]}"
 
     echo "=========================================================="
-    echo "[LAUNCH] $exp_name on GPU pair ${GPU_PAIR_LIST[$((idx % ${#GPU_PAIR_LIST[@]}))]}"
-    echo "Log: ${LOG_ROOT}/${exp_name}.log"
+    effective_name="${exp_name}${EXPERIMENT_NAME_SUFFIX}"
+    echo "[LAUNCH] $effective_name on GPU pair ${GPU_PAIR_LIST[$((idx % ${#GPU_PAIR_LIST[@]}))]}"
+    echo "Log: ${LOG_ROOT}/${effective_name}.log"
     echo "=========================================================="
 
     run_one "$idx" "$exp_name" "$use_dicom" "$use_context" "$freeze_vision" &

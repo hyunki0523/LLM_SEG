@@ -413,6 +413,15 @@ def main(args):
 
         # Initialize Model
         llm_repo = args.llm_repo if args.context else None
+        soft_prompt_mode = args.soft_prompt_mode
+        if soft_prompt_mode is None:
+            soft_prompt_mode = (
+                "learned" if "contexts" in cleaned_sd else "disabled"
+            )
+            accelerator.print(
+                "[INFO] Auto-detected soft_prompt_mode="
+                f"{soft_prompt_mode} from checkpoint keys."
+            )
         model = get_stunet_base(
             num_input_channels=3,
             num_classes=detected_num_classes,   
@@ -420,6 +429,7 @@ def main(args):
             context=args.context,
             llm_repo=llm_repo,
             use_lora=getattr(args, 'use_lora', False),
+            soft_prompt_mode=soft_prompt_mode,
             use_dicom=args.use_dicom,
             dicom_numeric_dim=10,
             dicom_category_sizes=(
@@ -817,6 +827,12 @@ if __name__ == "__main__":
         default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf/",
     )
     parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=False, help="Use PEFT LoRA for LLM backbone")
+    parser.add_argument(
+        "--soft_prompt_mode",
+        choices=["learned", "disabled"],
+        default=None,
+        help="Override soft-prompt mode; default auto-detects from checkpoint.",
+    )
     parser.add_argument("--patch_size", type=int, nargs=3, default=[32, 224, 224])
     parser.add_argument("--device", type=int, default=0)
     parser.add_argument("--context", action=argparse.BooleanOptionalAction, default=True)

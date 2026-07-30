@@ -26,6 +26,7 @@ from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from data.dataset import get_data_loaders
 from model_custom.stunet import get_stunet_base
+from model_custom.text_feature_cache import TextFeatureCache
 
 import warnings
 import wandb
@@ -237,6 +238,17 @@ def get_args_parser():
         help='Local path or HF repo id for the frozen Llama text backbone.',
     )
     parser.add_argument('--use_lora', action=argparse.BooleanOptionalAction, default=False, help='Use PEFT LoRA for LLM backbone')
+    parser.add_argument(
+        '--soft_prompt_mode',
+        default='learned',
+        choices=['learned', 'disabled'],
+        help='Use the trainable LLM prefix or disable it for a controlled ablation.',
+    )
+    parser.add_argument(
+        '--text_feature_cache',
+        default=None,
+        help='SQLite cache of frozen LLM token features. Requires --soft_prompt_mode disabled.',
+    )
 
 
 
@@ -312,6 +324,14 @@ def main(args):
         )
     if args.raw_fused_seg_weight < 0.0:
         raise ValueError("--raw_fused_seg_weight must be non-negative.")
+    if args.text_feature_cache and not args.context:
+        raise ValueError("--text_feature_cache requires --context.")
+    if args.text_feature_cache and args.soft_prompt_mode != "disabled":
+        raise ValueError(
+            "--text_feature_cache is only valid with --soft_prompt_mode disabled."
+        )
+    if args.text_feature_cache and args.use_lora:
+        raise ValueError("--text_feature_cache cannot be combined with LoRA.")
 
     detect_anomaly = os.environ.get("LLMSEG_DETECT_ANOMALY", "0") == "1"
     torch.autograd.set_detect_anomaly(detect_anomaly)
@@ -375,6 +395,8 @@ def main(args):
         "context_initial_alpha": args.context_initial_alpha,
         "context_min_alpha": args.context_min_alpha,
         "raw_fused_seg_weight": args.raw_fused_seg_weight,
+        "soft_prompt_mode": args.soft_prompt_mode,
+        "text_feature_cache": args.text_feature_cache or "",
         "memo": "자동생성된 실험 설정 로그"
     }
 
@@ -386,7 +408,11 @@ def main(args):
             "settings": wandb.Settings(init_timeout=300)
         }}
     )
-    accelerator.print(f"[ARGS] context={args.context} llm_repo={args.llm_repo}")
+    accelerator.print(
+        f"[ARGS] context={args.context} llm_repo={args.llm_repo} "
+        f"soft_prompt_mode={args.soft_prompt_mode} "
+        f"text_feature_cache={args.text_feature_cache or '<online>'}"
+    )
 
     # =========================
     # [WAVELET] 설정 & 입력 채널 계산
@@ -445,6 +471,43 @@ def main(args):
     llm_repo = args.llm_repo if args.context else None
     use_cls_loss = float(getattr(args, "cls_loss_weight", 0.0) or 0.0) > 0.0
     dicom_schema = data_metadata.get("dicom_schema")
+    text_feature_cache = (
+        TextFeatureCache(args.text_feature_cache, read_only=True)
+        if args.text_feature_cache
+        else None
+    )
+    cached_text_dim = int(
+        text_feature_cache.metadata.get("hidden_dim", 4096)
+        if text_feature_cache is not None
+        else 4096
+    )
+    if text_feature_cache is not None:
+        cache_soft_prompt_mode = text_feature_cache.metadata.get(
+            "soft_prompt_mode", "disabled"
+        )
+        if cache_soft_prompt_mode != "disabled":
+            raise ValueError(
+                "The selected cache was not generated in disabled-soft-prompt mode."
+            )
+        if int(text_feature_cache.metadata.get("max_length", -1)) != 128:
+            raise ValueError(
+                "Text cache max_length must match the model max_length=128."
+            )
+        if text_feature_cache.metadata.get("position_ids") != "attention_mask_cumsum":
+            raise ValueError(
+                "Text cache does not use cache-compatible attention-mask position IDs."
+            )
+        if text_feature_cache.metadata.get("text_columns") != [
+            "extracted_cc",
+            "chief_complaint",
+        ]:
+            raise ValueError(
+                "Text cache must contain extracted_cc and chief_complaint only."
+            )
+        accelerator.print(
+            f"[TEXT CACHE] entries={len(text_feature_cache)} "
+            f"hidden_dim={cached_text_dim} path={args.text_feature_cache}"
+        )
     dicom_category_sizes = (
         tuple(
             len(dicom_schema["categories"][column])
@@ -474,6 +537,9 @@ def main(args):
         dicom_category_sizes=dicom_category_sizes,
         context_initial_alpha=args.context_initial_alpha,
         context_min_alpha=args.context_min_alpha,
+        soft_prompt_mode=args.soft_prompt_mode,
+        use_cached_text_features=text_feature_cache is not None,
+        cached_text_dim=cached_text_dim,
      )
     accelerator.print('parameters(trainable):', count_params(model))
 
@@ -768,7 +834,16 @@ def main(args):
                     return_cls = cls_loss_fct is not None
                     if args.context:
                         contexts = list(batch['context'])
-                        if getattr(base_model, "tokenizer", None) is not None:
+                        cached_text_features = None
+                        cached_text_mask = None
+                        if text_feature_cache is not None:
+                            cached_text_features, cached_text_mask = (
+                                text_feature_cache.get_batch(
+                                    contexts, accelerator.device
+                                )
+                            )
+                            ctx_ids, attn_mask = None, None
+                        elif getattr(base_model, "tokenizer", None) is not None:
                             ctx_ids, attn_mask = make_context_tokens_batch(
                                 base_model.tokenizer, base_model.max_length, base_model.context_length,
                                 contexts, accelerator.device
@@ -784,6 +859,8 @@ def main(args):
                             image_in,
                             report_in=ctx_ids,
                             attn_mask=attn_mask,
+                            precomputed_text_features=cached_text_features,
+                            precomputed_text_mask=cached_text_mask,
                             dicom_numeric=dicom_numeric,
                             dicom_categorical=dicom_categorical,
                             return_cls=return_cls,
@@ -1098,7 +1175,16 @@ def main(args):
                         if args.context:
                             contexts = list(batch['context'])
                             base_eval_model = accelerator.unwrap_model(eval_model)
-                            if getattr(base_eval_model, "tokenizer", None) is not None:
+                            cached_text_features = None
+                            cached_text_mask = None
+                            if text_feature_cache is not None:
+                                cached_text_features, cached_text_mask = (
+                                    text_feature_cache.get_batch(
+                                        contexts, accelerator.device
+                                    )
+                                )
+                                ctx_ids, attn_mask = None, None
+                            elif getattr(base_eval_model, "tokenizer", None) is not None:
                                 ctx_ids, attn_mask = make_context_tokens_batch(
                                     base_eval_model.tokenizer, base_eval_model.max_length, base_eval_model.context_length,
                                     contexts, accelerator.device
@@ -1109,6 +1195,8 @@ def main(args):
                                 image_in,
                                 report_in=ctx_ids,
                                 attn_mask=attn_mask,
+                                precomputed_text_features=cached_text_features,
+                                precomputed_text_mask=cached_text_mask,
                                 dicom_numeric=dicom_numeric,
                                 dicom_categorical=dicom_categorical,
                                 cfg_scale=getattr(args, 'cfg_scale', 1.0),

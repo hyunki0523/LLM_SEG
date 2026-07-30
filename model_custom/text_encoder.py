@@ -46,6 +46,7 @@ class TextContextEncoder(nn.Module):
         text: torch.LongTensor,                 # [B, Seq_Len]
         context: torch.Tensor | None = None,    # [1, Prompt_Len, C]
         attn_mask: torch.Tensor | None = None,  # [B, Seq_Len]
+        position_ids_from_mask: bool = False,
     ):
         if not self.llm or self.transformer is None or self.token_embedding is None:
             raise ValueError("TextContextEncoder is not configured for LLM usage.")
@@ -97,12 +98,21 @@ class TextContextEncoder(nn.Module):
         # [BUGFIX] custom Gemma 모델에서 input_ids=None일 때 inputs_embeds의 차원을 잘못 유추하여 160GB OOM(Broadcasting bug)이
         # 발생하는 것을 막기 위해 명시적으로 position_ids를 생성해서 넘겨줍니다.
         B_val, seq_len, _ = x.shape
-        position_ids = (
-            torch.arange(0, seq_len, dtype=torch.long, device=x.device)
-            .unsqueeze(0)
-            .expand(B_val, -1)
-            .contiguous()
-        )
+        if position_ids_from_mask and full_attn_mask is not None:
+            # Cache-compatible left padding: valid tokens receive the same
+            # positions regardless of the longest string in the current batch.
+            position_ids = full_attn_mask.long().cumsum(dim=-1) - 1
+            position_ids.masked_fill_(full_attn_mask == 0, 0)
+            position_ids = position_ids.contiguous()
+        else:
+            # Backward-compatible path used by the existing learned-soft-prompt
+            # v2 experiments.
+            position_ids = (
+                torch.arange(0, seq_len, dtype=torch.long, device=x.device)
+                .unsqueeze(0)
+                .expand(B_val, -1)
+                .contiguous()
+            )
         
         # [CRITICAL BUGFIX] Gemma4 모델 내부의 get_per_layer_inputs 함수에서 llm_input_ids가 None일 때 
         # 차원 유추 실패로 160GB짜리 텐서를 생성해버리는(Broadcasting) 치명적 버그를 우회하는 Monkey Patch

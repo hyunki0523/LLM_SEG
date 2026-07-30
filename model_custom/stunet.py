@@ -194,6 +194,9 @@ class STUNet(nn.Module):
         dicom_embedding_dim: int = 256,
         context_initial_alpha: float = 0.10,
         context_min_alpha: float = 0.05,
+        soft_prompt_mode: str = "learned",
+        use_cached_text_features: bool = False,
+        cached_text_dim: int = 4096,
     ):
         super().__init__()
         self.conv_op = nn.Conv3d
@@ -215,6 +218,19 @@ class STUNet(nn.Module):
         self.use_lora = use_lora
         self.use_cls_head = use_cls_head
         self.use_dicom = bool(use_dicom)
+        self.soft_prompt_mode = str(soft_prompt_mode).lower()
+        if self.soft_prompt_mode not in {"learned", "disabled"}:
+            raise ValueError(
+                "soft_prompt_mode must be one of: learned, disabled"
+            )
+        self.use_cached_text_features = bool(use_cached_text_features)
+        self.cached_text_dim = int(cached_text_dim)
+        if self.use_cached_text_features and self.soft_prompt_mode != "disabled":
+            raise ValueError(
+                "Cached text features require soft_prompt_mode='disabled'."
+            )
+        if self.use_cached_text_features and self.use_lora:
+            raise ValueError("Cached text features are incompatible with LoRA.")
         if str(self.llm_repo).lower() in ["False","false", "none", ""]:
             print("[INFO] Vision-Only.")
             self.tokenizer = None
@@ -327,6 +343,46 @@ class STUNet(nn.Module):
         # multimodal text encoder
         if self.context and str(self.llm_repo).lower() not in ["false", "none", ""]:
             print(f"[LLM] llm_repo = {self.llm_repo}")
+            if self.use_cached_text_features:
+                # Cached rows are final frozen-Llama token states. Build only
+                # the trainable concept/fusion modules and keep the 7B model
+                # entirely out of this process.
+                token_embed_dim = self.cached_text_dim
+                self.tokenizer = None
+                self.text_encoder = None
+                self.context_length = 0
+                self.register_parameter("contexts", None)
+                self.max_length = 128
+                self.concept_extractor = HybridConceptExtractor(
+                    token_embed_dim, num_open_queries=2, num_heads=8
+                )
+                self.text_burden_head = nn.Sequential(
+                    nn.LayerNorm(token_embed_dim),
+                    nn.Linear(token_embed_dim, 1),
+                )
+                self.text_trauma_head = nn.Sequential(
+                    nn.LayerNorm(token_embed_dim),
+                    nn.Linear(token_embed_dim, 1),
+                )
+                decoder_dims = list(reversed(dims[:-1]))
+                self.context_fusions = nn.ModuleList(
+                    [
+                        GroundedResidualFusion3D(
+                            channels,
+                            token_embed_dim,
+                            num_heads=8,
+                            initial_alpha=context_initial_alpha,
+                            min_alpha=context_min_alpha,
+                        )
+                        for channels in decoder_dims[:3]
+                    ]
+                )
+                self.context_aux = {}
+                print(
+                    "[INFO] Cached text features enabled; frozen Llama loading "
+                    "is skipped."
+                )
+                return
             # 1) 텍스트 인코더 래퍼
             self.text_encoder = TextContextEncoder(embed_dim=None)
             self.context_length = 8
@@ -481,9 +537,16 @@ class STUNet(nn.Module):
             if token_embed_dim is None:
                 token_embed_dim = getattr(self.text_encoder.token_embedding, "embedding_dim", None)
 
-            # 4) learnable prompt contexts
-            self.context_length = 16  # 필요에 따라 16~32 정도로 조절 가능
-            self.contexts = nn.Parameter(torch.randn(1, self.context_length, token_embed_dim))
+            # 4) Controlled soft-prompt ablation. Cached LLM features are only
+            # valid when this trainable prefix is disabled.
+            if self.soft_prompt_mode == "learned":
+                self.context_length = 16
+                self.contexts = nn.Parameter(
+                    torch.randn(1, self.context_length, token_embed_dim)
+                )
+            else:
+                self.context_length = 0
+                self.register_parameter("contexts", None)
             self.max_length = 128
 
 
@@ -540,6 +603,8 @@ class STUNet(nn.Module):
         x,
         report_in=None,
         attn_mask=None,
+        precomputed_text_features=None,
+        precomputed_text_mask=None,
         dicom_numeric=None,
         dicom_categorical=None,
         cfg_scale=1.0,
@@ -549,7 +614,10 @@ class STUNet(nn.Module):
         context_patch_mask_probability: float = 0.0,
         context_hard_bypass_threshold: float = 0.0,
     ):
-        if return_context_variants and report_in is not None and self.context:
+        has_text_input = (
+            report_in is not None or precomputed_text_features is not None
+        )
+        if return_context_variants and has_text_input and self.context:
             fused_x = x
             observed_mask_rate = x.new_zeros(())
             if self.training and context_patch_mask_probability > 0:
@@ -570,6 +638,8 @@ class STUNet(nn.Module):
                 fused_x,
                 report_in,
                 attn_mask,
+                precomputed_text_features,
+                precomputed_text_mask,
                 dicom_numeric,
                 dicom_categorical,
                 force_drop_text=False,
@@ -583,6 +653,8 @@ class STUNet(nn.Module):
                 x,
                 report_in,
                 attn_mask,
+                precomputed_text_features,
+                precomputed_text_mask,
                 dicom_numeric,
                 dicom_categorical,
                 force_drop_text=True,
@@ -641,13 +713,17 @@ class STUNet(nn.Module):
             # --- Classifier-Free Guidance (CFG) Inference ---
             # 1. Conditional Pass (Text = Normal)
             out_cond = self._forward_impl(
-                x, report_in, attn_mask, dicom_numeric, dicom_categorical,
+                x, report_in, attn_mask,
+                precomputed_text_features, precomputed_text_mask,
+                dicom_numeric, dicom_categorical,
                 force_drop_text=False, return_cls=return_cls
             )
             
             # 2. Unconditional Pass (Text = Dropped)
             out_uncond = self._forward_impl(
-                x, report_in, attn_mask, dicom_numeric, dicom_categorical,
+                x, report_in, attn_mask,
+                precomputed_text_features, precomputed_text_mask,
+                dicom_numeric, dicom_categorical,
                 force_drop_text=True, return_cls=return_cls
             )
 
@@ -672,6 +748,8 @@ class STUNet(nn.Module):
             x,
             report_in,
             attn_mask,
+            precomputed_text_features,
+            precomputed_text_mask,
             dicom_numeric,
             dicom_categorical,
             force_drop_text=False,
@@ -684,6 +762,8 @@ class STUNet(nn.Module):
         x,
         report_in=None,
         attn_mask=None,
+        precomputed_text_features=None,
+        precomputed_text_mask=None,
         dicom_numeric=None,
         dicom_categorical=None,
         force_drop_text=False,
@@ -720,15 +800,30 @@ class STUNet(nn.Module):
             concepts = None
             context_keep = None
             self.context_aux = {}
-            if (
+            emb_txt = None
+            full_attn_mask = None
+            if not force_drop_text and precomputed_text_features is not None:
+                if not self.use_cached_text_features:
+                    raise ValueError(
+                        "Precomputed text requires "
+                        "use_cached_text_features=True."
+                    )
+                emb_txt = precomputed_text_features.to(x.device)
+                if precomputed_text_mask is not None:
+                    full_attn_mask = precomputed_text_mask.to(x.device)
+            elif (
                 not force_drop_text
                 and getattr(self, "text_encoder", None) is not None
                 and report_in is not None
             ):
                 # LLM + Vision 모드: 항상 텍스트 브랜치를 실행하여 DDP 연산 그래프 유지
                 emb_txt, full_attn_mask = self.text_encoder(
-                    report_in.to(x.device), self.contexts, attn_mask=attn_mask
+                    report_in.to(x.device),
+                    self.contexts,
+                    attn_mask=attn_mask,
+                    position_ids_from_mask=self.soft_prompt_mode == "disabled",
                 )
+            if emb_txt is not None:
                 concepts, concept_attention = self.concept_extractor(
                     emb_txt, full_attn_mask
                 )
@@ -929,6 +1024,9 @@ def get_stunet_small(
     dicom_category_sizes=(2, 2),
     context_initial_alpha: float = 0.10,
     context_min_alpha: float = 0.05,
+    soft_prompt_mode: str = "learned",
+    use_cached_text_features: bool = False,
+    cached_text_dim: int = 4096,
 ):
     kernel_sizes = [[3, 3, 3]] * 6
     if len(strides) > 5:
@@ -954,6 +1052,9 @@ def get_stunet_small(
         dicom_category_sizes=dicom_category_sizes,
         context_initial_alpha=context_initial_alpha,
         context_min_alpha=context_min_alpha,
+        soft_prompt_mode=soft_prompt_mode,
+        use_cached_text_features=use_cached_text_features,
+        cached_text_dim=cached_text_dim,
     )
 
 
@@ -972,6 +1073,9 @@ def get_stunet_base(
     dicom_category_sizes=(2, 2),
     context_initial_alpha: float = 0.10,
     context_min_alpha: float = 0.05,
+    soft_prompt_mode: str = "learned",
+    use_cached_text_features: bool = False,
+    cached_text_dim: int = 4096,
 ):
     kernel_sizes = [[3, 3, 3]] * 6
     if len(strides) > 5:
@@ -997,6 +1101,9 @@ def get_stunet_base(
         dicom_category_sizes=dicom_category_sizes,
         context_initial_alpha=context_initial_alpha,
         context_min_alpha=context_min_alpha,
+        soft_prompt_mode=soft_prompt_mode,
+        use_cached_text_features=use_cached_text_features,
+        cached_text_dim=cached_text_dim,
     )
 
 
@@ -1015,6 +1122,9 @@ def get_stunet_large(
     dicom_category_sizes=(2, 2),
     context_initial_alpha: float = 0.10,
     context_min_alpha: float = 0.05,
+    soft_prompt_mode: str = "learned",
+    use_cached_text_features: bool = False,
+    cached_text_dim: int = 4096,
 ):
     kernel_sizes = [[3, 3, 3]] * 6
     if len(strides) > 5:
@@ -1040,4 +1150,7 @@ def get_stunet_large(
         dicom_category_sizes=dicom_category_sizes,
         context_initial_alpha=context_initial_alpha,
         context_min_alpha=context_min_alpha,
+        soft_prompt_mode=soft_prompt_mode,
+        use_cached_text_features=use_cached_text_features,
+        cached_text_dim=cached_text_dim,
     )
