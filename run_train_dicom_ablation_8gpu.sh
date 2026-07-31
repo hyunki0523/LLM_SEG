@@ -63,10 +63,16 @@ else
     GPU_PAIR_LIST=("0,1" "2,3" "4,5" "6,7")
 fi
 MAX_PARALLEL="${MAX_PARALLEL:-4}"
+NUM_PROCESSES_PER_JOB="${NUM_PROCESSES_PER_JOB:-2}"
 RUN_EXTRA_MODES="${RUN_EXTRA_MODES:-0}"
 OVERWRITE_TRAIN="${OVERWRITE_TRAIN:-0}"
 ONLY_EXPERIMENTS="${ONLY_EXPERIMENTS:-}"
 AUTO_RESUME="${AUTO_RESUME:-1}"
+
+if ! [[ "$NUM_PROCESSES_PER_JOB" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] NUM_PROCESSES_PER_JOB must be a positive integer."
+    exit 2
+fi
 
 CORE_EXPERIMENTS=(
     "vision_only|False|False|False"
@@ -154,6 +160,11 @@ export LLMSEG_FORCE_MATH_SDP="${LLMSEG_FORCE_MATH_SDP:-1}"
 # CUBLAS_STATUS_INTERNAL_ERROR on this cu132 Blackwell build. Limit FP32 to the
 # small concept-query and spatial-to-concept attention operations.
 export LLMSEG_FORCE_FP32_MHA="${LLMSEG_FORCE_FP32_MHA:-1}"
+# This stack was stable with CUDA P2P and CUDA-memory transport disabled.
+# Single-GPU v3a jobs are unaffected; multi-GPU callers may override after
+# separately validating NCCL on their exact driver/runtime combination.
+export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
+export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 export TRAIN_CSV VALID_CSV
 export LLMSEG_SKIP_MISSING_IMAGE_PATHS="$SKIP_MISSING_IMAGE_PATHS"
 export LLMSEG_IMAGE_PATH_REWRITE_FROM="$IMAGE_PATH_REWRITE_FROM"
@@ -179,6 +190,7 @@ echo "[INFO] PRETRAINED=${PRETRAINED:-<none>}"
 echo "[INFO] LOG_ROOT=$LOG_ROOT"
 echo "[INFO] GPU_PAIRS=${GPU_PAIR_LIST[*]}"
 echo "[INFO] MAX_PARALLEL=$MAX_PARALLEL"
+echo "[INFO] NUM_PROCESSES_PER_JOB=$NUM_PROCESSES_PER_JOB"
 echo "[INFO] RUN_EXTRA_MODES=$RUN_EXTRA_MODES"
 echo "[INFO] ONLY_EXPERIMENTS=${ONLY_EXPERIMENTS:-<all>}"
 echo "[INFO] AUTO_RESUME=$AUTO_RESUME"
@@ -193,6 +205,8 @@ echo "[INFO] EXPERIMENT_NAME_SUFFIX=${EXPERIMENT_NAME_SUFFIX:-<none>}"
 echo "[INFO] LLM_ATTN_IMPLEMENTATION=$LLM_ATTN_IMPLEMENTATION"
 echo "[INFO] LLMSEG_FORCE_MATH_SDP=$LLMSEG_FORCE_MATH_SDP"
 echo "[INFO] LLMSEG_FORCE_FP32_MHA=$LLMSEG_FORCE_FP32_MHA"
+echo "[INFO] NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
+echo "[INFO] NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE"
 echo "[INFO] CHECK_IMAGE_PATHS=$CHECK_IMAGE_PATHS"
 echo "[INFO] SKIP_MISSING_IMAGE_PATHS=$SKIP_MISSING_IMAGE_PATHS"
 if [ -n "$LLMSEG_IMAGE_PATH_REWRITE_FROM" ] || [ -n "$LLMSEG_IMAGE_PATH_REWRITE_TO" ]; then
@@ -318,7 +332,7 @@ run_one() {
         echo "=========================================================="
 
         CUDA_VISIBLE_DEVICES="$gpu_pair" accelerate launch \
-            --num_processes 2 \
+            --num_processes "$NUM_PROCESSES_PER_JOB" \
             --num_machines 1 \
             --mixed_precision "$MIXED_PRECISION_MODE" \
             --main_process_port "$port" \

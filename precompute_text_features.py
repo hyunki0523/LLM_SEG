@@ -47,7 +47,7 @@ def load_frozen_text_encoder(
     )
     model = AutoModel.from_pretrained(
         llm_repo,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
         attn_implementation="eager",

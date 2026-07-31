@@ -1,5 +1,9 @@
 # v3a soft-prompt/cache 실험 체크리스트
 
+> 4-GPU 환경에서는 `NEXT_EXPERIMENT_PLAN_4GPU.md`와
+> `run_train_v3a_4gpu_parallel.sh`를 우선 사용한다. online Llama를
+> 2-GPU DDP로 실행하는 기존 launcher는 비교/호환 목적으로만 남긴다.
+
 이번 단계에서는 fusion 구조와 loss를 v2로 고정하고 soft prompt와 Llama
 feature cache만 비교합니다. DICOM FiLM, correlation grounding, deep
 supervision은 섞지 않습니다.

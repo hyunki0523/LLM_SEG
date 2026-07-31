@@ -1,0 +1,3 @@
+# Optional only. The v3a soft-prompt/cache experiments keep LoRA disabled.
+# Transformers 5.14 requires the current PEFT adapter API.
+peft==0.19.1
