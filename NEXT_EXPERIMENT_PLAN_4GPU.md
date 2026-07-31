@@ -41,8 +41,13 @@ EXPECTED_GPUS=4 bash install_requirements_cu132.sh
 
 설치 스크립트는 이 저장소에서 사용하지 않으면서 dependency 충돌을
 일으키는 `tiatoolbox`, `timm`, `ninja`, `torchaudio`, `torchvision`을
-제거한다. 기존 `torch==2.12.1+cu130`이 설치되어 있어도
-`--force-reinstall --no-cache-dir`로 cu132 wheel을 다시 설치한다.
+제거한다. 기존 `torch==2.12.1+cu130`은 CUDA 13 조건을 만족하므로
+그대로 사용한다. cu132로 정확히 교체해야 할 때만 다음을 사용한다.
+
+```bash
+FORCE_TORCH_REINSTALL=1 TORCH_CUDA_INDEX=cu132 \
+  EXPECTED_GPUS=4 bash install_requirements_cu132.sh
+```
 
 기존 환경을 검사만 할 때:
 

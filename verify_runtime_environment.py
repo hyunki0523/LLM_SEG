@@ -72,11 +72,14 @@ def main() -> None:
 
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available to PyTorch.")
-    if torch.version.cuda != "13.2":
+    cuda_runtime = tuple(
+        int(part) for part in (torch.version.cuda or "0.0").split(".")[:2]
+    )
+    if cuda_runtime < (13, 0):
         raise RuntimeError(
-            f"Expected PyTorch CUDA runtime 13.2, got {torch.version.cuda}. "
+            f"Expected PyTorch CUDA runtime >=13.0, got {torch.version.cuda}. "
             "The package name is 'torch' (not 'pytorch'); rerun "
-            "install_requirements_cu132.sh to replace a cached cu130 build."
+            "install_requirements_cu132.sh."
         )
 
     expected_gpus = int(os.environ.get("EXPECTED_GPUS", "4"))
