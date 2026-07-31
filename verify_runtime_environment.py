@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 from __future__ import annotations
 
-import importlib.util
 import os
 import platform
 from importlib import metadata
@@ -28,6 +27,14 @@ def package_version(name: str) -> str:
         raise RuntimeError(f"Required package is missing: {name}") from exc
 
 
+def package_is_installed(name: str) -> bool:
+    try:
+        metadata.version(name)
+        return True
+    except metadata.PackageNotFoundError:
+        return False
+
+
 def main() -> None:
     print(f"[ENV] Python={platform.python_version()}")
     for package, expected in EXPECTED_VERSIONS.items():
@@ -42,8 +49,14 @@ def main() -> None:
             )
         print(f"[ENV] {package}={actual}")
 
-    for unused_package in ("torchaudio", "torchvision"):
-        if importlib.util.find_spec(unused_package) is not None:
+    for unused_package in (
+        "torchaudio",
+        "torchvision",
+        "tiatoolbox",
+        "timm",
+        "ninja",
+    ):
+        if package_is_installed(unused_package):
             raise RuntimeError(
                 f"{unused_package} must remain uninstalled in this "
                 "segmentation runtime."
@@ -61,7 +74,9 @@ def main() -> None:
         raise RuntimeError("CUDA is not available to PyTorch.")
     if torch.version.cuda != "13.2":
         raise RuntimeError(
-            f"Expected PyTorch CUDA runtime 13.2, got {torch.version.cuda}"
+            f"Expected PyTorch CUDA runtime 13.2, got {torch.version.cuda}. "
+            "The package name is 'torch' (not 'pytorch'); rerun "
+            "install_requirements_cu132.sh to replace a cached cu130 build."
         )
 
     expected_gpus = int(os.environ.get("EXPECTED_GPUS", "4"))

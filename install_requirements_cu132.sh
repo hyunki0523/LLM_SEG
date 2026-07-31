@@ -19,14 +19,24 @@ PY
 
 "$PYTHON_EXE" -m pip install --upgrade pip setuptools wheel
 
-# Audio and torchvision are unused here; stale builds pinning an older torch
-# would make the CUDA 13.2 environment inconsistent.
-"$PYTHON_EXE" -m pip uninstall -y torchaudio torchvision || true
+# These packages belong to the base pathology/image environment, are not
+# imported by LLM_SEG_hk, and impose mutually incompatible torchvision,
+# Transformers, PyYAML and scikit-image constraints. Torch is force-reinstalled
+# below so pip cannot report "already satisfied" for a cu130 build.
+"$PYTHON_EXE" -m pip uninstall -y \
+    torchaudio \
+    torchvision \
+    tiatoolbox \
+    timm \
+    ninja \
+    || true
 
 # Install the official CUDA 13.2 wheel separately so the generic PyPI resolver
 # cannot silently select a CPU or another CUDA build. torchvision is omitted
 # because this repository does not import it.
 "$PYTHON_EXE" -m pip install \
+    --no-cache-dir \
+    --force-reinstall \
     torch==2.12.1 \
     --index-url https://download.pytorch.org/whl/cu132
 
