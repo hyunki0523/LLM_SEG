@@ -31,6 +31,7 @@ PRETRAINED="${PRETRAINED:-}"
 
 PATCH_SIZE="${PATCH_SIZE:-32 224 224}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
+LR="${LR:-1e-5}"
 EPOCHS="${EPOCHS:-300}"
 N_ITER_PER_EPOCH="${N_ITER_PER_EPOCH:-256}"
 N_ITER_VALID="${N_ITER_VALID:-50}"
@@ -40,6 +41,7 @@ LOSS_FCT="${LOSS_FCT:-tversky}"
 MIXED_PRECISION_MODE="${MIXED_PRECISION_MODE:-bf16}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 NUM_WORKERS="${NUM_WORKERS:-6}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-10}"
 TEXT_FUSION_WARMUP_EPOCHS="${TEXT_FUSION_WARMUP_EPOCHS:-30}"
 TEXT_FUSION_TRANSITION_EPOCHS="${TEXT_FUSION_TRANSITION_EPOCHS:-30}"
 CONTEXT_INITIAL_ALPHA="${CONTEXT_INITIAL_ALPHA:-0.10}"
@@ -49,9 +51,12 @@ SOFT_PROMPT_MODE="${SOFT_PROMPT_MODE:-learned}"
 TEXT_FEATURE_CACHE="${TEXT_FEATURE_CACHE:-}"
 EXPERIMENT_NAME_SUFFIX="${EXPERIMENT_NAME_SUFFIX:-}"
 STREAM_LOGS="${STREAM_LOGS:-0}"
+DEEP_SUPERVISION="${DEEP_SUPERVISION:-0}"
+DEEP_SUPERVISION_WEIGHTS="${DEEP_SUPERVISION_WEIGHTS:-1.0,0.3,0.1}"
 CFG_SCALE=1
 BASE_PORT="${BASE_PORT:-29600}"
 CHECK_IMAGE_PATHS="${CHECK_IMAGE_PATHS:-1}"
+CHECK_DATASET_CONTRACT="${CHECK_DATASET_CONTRACT:-1}"
 SKIP_MISSING_IMAGE_PATHS="${SKIP_MISSING_IMAGE_PATHS:-1}"
 DEFAULT_IMAGE_PATH_REWRITE_FROM="/mnt/nas100/Brain_ER/data/BrainCT_NIfTIv2"
 DEFAULT_IMAGE_PATH_REWRITE_TO="/mnt/nas100/Brain_ER/IDs/kevin/BrainCT_NIfTIv2"
@@ -177,11 +182,13 @@ if ! "$PYTHON_EXE" -c 'import nibabel; print(f"[CHECK] nibabel={nibabel.__versio
     "$PYTHON_EXE" -c 'import nibabel; print(f"[CHECK] nibabel={nibabel.__version__}")'
 fi
 
-echo "[INFO] Auditing multimodal data contract..."
-$PYTHON_EXE audit_dataset_contract.py \
-    --train-csv "$TRAIN_CSV" \
-    --valid-csv "$VALID_CSV" \
-    --output "$LOG_ROOT/dataset_contract_report.json"
+if [ "$CHECK_DATASET_CONTRACT" = "1" ]; then
+    echo "[INFO] Auditing multimodal data contract..."
+    $PYTHON_EXE audit_dataset_contract.py \
+        --train-csv "$TRAIN_CSV" \
+        --valid-csv "$VALID_CSV" \
+        --output "$LOG_ROOT/dataset_contract_report.json"
+fi
 
 echo "[INFO] PROJECT_DIR=$PROJECT_DIR"
 echo "[INFO] TRAIN_CSV=$TRAIN_CSV"
@@ -192,6 +199,8 @@ echo "[INFO] LOG_ROOT=$LOG_ROOT"
 echo "[INFO] GPU_PAIRS=${GPU_PAIR_LIST[*]}"
 echo "[INFO] MAX_PARALLEL=$MAX_PARALLEL"
 echo "[INFO] NUM_PROCESSES_PER_JOB=$NUM_PROCESSES_PER_JOB"
+echo "[INFO] LR=$LR"
+echo "[INFO] WARMUP_EPOCHS=$WARMUP_EPOCHS"
 echo "[INFO] RUN_EXTRA_MODES=$RUN_EXTRA_MODES"
 echo "[INFO] ONLY_EXPERIMENTS=${ONLY_EXPERIMENTS:-<all>}"
 echo "[INFO] AUTO_RESUME=$AUTO_RESUME"
@@ -203,12 +212,15 @@ echo "[INFO] RAW_FUSED_SEG_WEIGHT=$RAW_FUSED_SEG_WEIGHT"
 echo "[INFO] SOFT_PROMPT_MODE=$SOFT_PROMPT_MODE"
 echo "[INFO] TEXT_FEATURE_CACHE=${TEXT_FEATURE_CACHE:-<online>}"
 echo "[INFO] EXPERIMENT_NAME_SUFFIX=${EXPERIMENT_NAME_SUFFIX:-<none>}"
+echo "[INFO] DEEP_SUPERVISION=$DEEP_SUPERVISION"
+echo "[INFO] DEEP_SUPERVISION_WEIGHTS=$DEEP_SUPERVISION_WEIGHTS"
 echo "[INFO] LLM_ATTN_IMPLEMENTATION=$LLM_ATTN_IMPLEMENTATION"
 echo "[INFO] LLMSEG_FORCE_MATH_SDP=$LLMSEG_FORCE_MATH_SDP"
 echo "[INFO] LLMSEG_FORCE_FP32_MHA=$LLMSEG_FORCE_FP32_MHA"
 echo "[INFO] NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
 echo "[INFO] NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE"
 echo "[INFO] CHECK_IMAGE_PATHS=$CHECK_IMAGE_PATHS"
+echo "[INFO] CHECK_DATASET_CONTRACT=$CHECK_DATASET_CONTRACT"
 echo "[INFO] SKIP_MISSING_IMAGE_PATHS=$SKIP_MISSING_IMAGE_PATHS"
 if [ -n "$LLMSEG_IMAGE_PATH_REWRITE_FROM" ] || [ -n "$LLMSEG_IMAGE_PATH_REWRITE_TO" ]; then
     echo "[INFO] IMAGE_PATH_REWRITE_FROM=$LLMSEG_IMAGE_PATH_REWRITE_FROM"
@@ -291,6 +303,12 @@ run_one() {
     if [ -n "$PRETRAINED" ]; then
         pretrained_args=(--pretrained "$PRETRAINED")
     fi
+    local deep_supervision_args
+    if [ "$DEEP_SUPERVISION" = "1" ]; then
+        deep_supervision_args=(--deep_supervision)
+    else
+        deep_supervision_args=(--no-deep_supervision)
+    fi
 
     local slot=$((exp_idx % ${#GPU_PAIR_LIST[@]}))
     local gpu_pair="${GPU_PAIR_LIST[$slot]}"
@@ -350,6 +368,7 @@ run_one() {
             --mixed_precision "$MIXED_PRECISION_MODE" \
             --patch_size $PATCH_SIZE \
             --batch_size "$BATCH_SIZE" \
+            --lr "$LR" \
             --grad_accum "$GRAD_ACCUM" \
             --num_workers "$NUM_WORKERS" \
             "${context_args[@]}" \
@@ -357,6 +376,8 @@ run_one() {
             "${freeze_args[@]}" \
             "${pretrained_args[@]}" \
             "${resume_args[@]}" \
+            "${deep_supervision_args[@]}" \
+            --deep_supervision_weights "$DEEP_SUPERVISION_WEIGHTS" \
             --checkpoint_dir "$checkpoint_dir" \
             --experiment_name "$effective_name" \
             --train_csv "$TRAIN_CSV" \
@@ -367,6 +388,7 @@ run_one() {
             --checkpoint_interval "$CHECKPOINT_INTERVAL" \
             --positive_prob "$POSITIVE_PROB" \
             --loss_fct "$LOSS_FCT" \
+            --warmup_epochs "$WARMUP_EPOCHS" \
             --text_fusion_warmup_epochs "$TEXT_FUSION_WARMUP_EPOCHS" \
             --text_fusion_transition_epochs "$TEXT_FUSION_TRANSITION_EPOCHS" \
             --context_initial_alpha "$CONTEXT_INITIAL_ALPHA" \

@@ -206,6 +206,9 @@ class STUNet(nn.Module):
         self.final_nonlin = lambda x: x
         self.decoder = Decoder()
         self.decoder.deep_supervision = enable_deep_supervision
+        # Final output plus the two highest-resolution auxiliary decoder heads.
+        # train.py may override this before the first forward pass.
+        self.deep_supervision_scales = 3
         self.upscale_logits = False
 
         self.pool_op_kernel_sizes = pool_op_kernel_sizes
@@ -866,14 +869,27 @@ class STUNet(nn.Module):
                     )
                     self.context_aux[f"fusion_{u}"] = fusion_stats
                 
-                seg_outputs.append(self.final_nonlin(self.seg_outputs[u](x)))
+                use_seg_head = (
+                    u == len(self.conv_blocks_localization) - 1
+                    or (
+                        getattr(self.decoder, "deep_supervision", False)
+                        and u
+                        >= len(self.conv_blocks_localization)
+                        - int(self.deep_supervision_scales)
+                    )
+                )
+                if use_seg_head:
+                    seg_outputs.append(
+                        self.final_nonlin(self.seg_outputs[u](x))
+                    )
                 if getattr(self, "return_features", False):
                     features.append(x)
 
             if getattr(self.decoder, "deep_supervision", False):
-                final_outs = tuple(
-                    [seg_outputs[-1]] + [i(j) for i, j in zip(list(self.upscale_logits_ops)[::-1], seg_outputs[:-1][::-1])]
-                )
+                # Return native-resolution logits in final-to-coarse order.
+                # Upsampling every auxiliary output to full resolution wastes
+                # VRAM and blurs the supervision signal for small lesions.
+                final_outs = tuple(seg_outputs[::-1])
             elif getattr(self, "return_features", False):
                 final_outs = features[-1]
             else:

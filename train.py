@@ -108,6 +108,83 @@ def count_params(model):
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
+def parse_deep_supervision_weights(value):
+    if isinstance(value, (tuple, list)):
+        weights = tuple(float(item) for item in value)
+    else:
+        try:
+            weights = tuple(
+                float(item.strip())
+                for item in str(value).split(",")
+                if item.strip()
+            )
+        except ValueError as exc:
+            raise argparse.ArgumentTypeError(
+                "Deep-supervision weights must be comma-separated numbers."
+            ) from exc
+    if not weights or weights[0] <= 0 or any(weight < 0 for weight in weights):
+        raise argparse.ArgumentTypeError(
+            "Deep-supervision weights require a positive final-output weight "
+            "and non-negative auxiliary weights."
+        )
+    return weights
+
+
+def final_segmentation_logits(logits):
+    return logits[0] if isinstance(logits, (tuple, list)) else logits
+
+
+def lesion_preserving_target(mask, spatial_shape, as_long):
+    target = (mask > 0).float()
+    if target.ndim == 4:
+        target = target.unsqueeze(1)
+    target_shape = tuple(int(size) for size in target.shape[2:])
+    output_shape = tuple(int(size) for size in spatial_shape)
+    if target_shape != output_shape:
+        if all(out_size <= target_size for out_size, target_size in zip(output_shape, target_shape)):
+            target = F.adaptive_max_pool3d(target, output_shape)
+        else:
+            target = F.interpolate(target, size=output_shape, mode="nearest")
+    return (target > 0).long() if as_long else target
+
+
+def weighted_segmentation_loss(
+    logits,
+    mask,
+    loss_fct,
+    loss_name,
+    deep_supervision_weights,
+):
+    outputs = tuple(logits) if isinstance(logits, (tuple, list)) else (logits,)
+    if len(outputs) == 1:
+        weights = (1.0,)
+    else:
+        if len(deep_supervision_weights) != len(outputs):
+            raise ValueError(
+                "Deep-supervision output/weight mismatch: "
+                f"outputs={len(outputs)}, weights={len(deep_supervision_weights)}"
+            )
+        weight_sum = sum(deep_supervision_weights)
+        if weight_sum <= 0:
+            raise ValueError("Deep-supervision weights must have a positive sum.")
+        weights = tuple(weight / weight_sum for weight in deep_supervision_weights)
+
+    use_class_target = loss_name in {"dice", "dice_focal", "tversky", "gdfl"}
+    component_losses = []
+    targets = []
+    for output in outputs:
+        target = lesion_preserving_target(
+            mask, output.shape[2:], as_long=use_class_target
+        )
+        component_losses.append(loss_fct(output.float(), target))
+        targets.append(target)
+    total = sum(
+        weight * component
+        for weight, component in zip(weights, component_losses)
+    )
+    return total, outputs[0], targets[0], tuple(component_losses)
+
+
 # =========================
 # [WAVELET] 3D Wavelet 클래스
 # =========================
@@ -191,6 +268,18 @@ def get_args_parser():
                         help='Differentiable lower bound for learned text-residual strength.')
     parser.add_argument('--raw_fused_seg_weight', default=0.5, type=float,
                         help='Direct segmentation loss weight for the masked text-conditioned pass.')
+    parser.add_argument(
+        '--deep_supervision',
+        default=False,
+        action=argparse.BooleanOptionalAction,
+        help='Supervise the final and selected high-resolution decoder outputs.',
+    )
+    parser.add_argument(
+        '--deep_supervision_weights',
+        default=(1.0, 0.3, 0.1),
+        type=parse_deep_supervision_weights,
+        help='Final-to-coarse loss weights, for example 1.0,0.3,0.1.',
+    )
     parser.add_argument('--context_patch_mask_probability', default=0.15, type=float,
                         help='Coarse vision-patch masking probability for the text-conditioned pass.')
     parser.add_argument('--context_hard_bypass_threshold', default=0.5, type=float,
@@ -332,6 +421,14 @@ def main(args):
         )
     if args.text_feature_cache and args.use_lora:
         raise ValueError("--text_feature_cache cannot be combined with LoRA.")
+    if args.deep_supervision and args.use_wavelet:
+        raise ValueError(
+            "Partial deep supervision currently requires --use_wavelet False."
+        )
+    if args.deep_supervision and len(args.deep_supervision_weights) < 2:
+        raise ValueError(
+            "--deep_supervision requires at least one auxiliary weight."
+        )
 
     detect_anomaly = os.environ.get("LLMSEG_DETECT_ANOMALY", "0") == "1"
     torch.autograd.set_detect_anomaly(detect_anomaly)
@@ -395,6 +492,8 @@ def main(args):
         "context_initial_alpha": args.context_initial_alpha,
         "context_min_alpha": args.context_min_alpha,
         "raw_fused_seg_weight": args.raw_fused_seg_weight,
+        "deep_supervision": args.deep_supervision,
+        "deep_supervision_weights": list(args.deep_supervision_weights),
         "soft_prompt_mode": args.soft_prompt_mode,
         "text_feature_cache": args.text_feature_cache or "",
         "memo": "자동생성된 실험 설정 로그"
@@ -527,7 +626,7 @@ def main(args):
     model = get_stunet_base(
         num_input_channels=in_channels,
         num_classes=out_ch,
-        enable_deep_supervision=False,
+        enable_deep_supervision=args.deep_supervision,
         context=args.context,
         llm_repo=llm_repo,
         use_lora=getattr(args, 'use_lora', False),
@@ -541,6 +640,14 @@ def main(args):
         use_cached_text_features=text_feature_cache is not None,
         cached_text_dim=cached_text_dim,
      )
+    model.deep_supervision_scales = (
+        len(args.deep_supervision_weights) if args.deep_supervision else 1
+    )
+    if model.deep_supervision_scales > len(model.seg_outputs):
+        raise ValueError(
+            "Requested more deep-supervision scales than decoder heads: "
+            f"{model.deep_supervision_scales} > {len(model.seg_outputs)}"
+        )
     accelerator.print('parameters(trainable):', count_params(model))
 
     if args.pretrained is not None and os.path.exists(args.pretrained):
@@ -576,7 +683,17 @@ def main(args):
                 p.requires_grad_(False)
         model.text_encoder.eval()
 
-    if not model.decoder.deep_supervision:
+    first_supervised_head = len(model.seg_outputs) - model.deep_supervision_scales
+    for output_head in list(model.seg_outputs)[:first_supervised_head]:
+        for parameter in output_head.parameters():
+            parameter.requires_grad_(False)
+    if args.deep_supervision:
+        accelerator.print(
+            "[DEEP SUPERVISION] native decoder scales="
+            f"{model.deep_supervision_scales}, final-to-coarse weights="
+            f"{tuple(args.deep_supervision_weights)}"
+        )
+    else:
         for output_head in list(model.seg_outputs)[:-1]:
             for parameter in output_head.parameters():
                 parameter.requires_grad_(False)
@@ -906,46 +1023,49 @@ def main(args):
                         raw_fused_seg_logits = raw_fused_logits_wt
 
                     # === Loss 계산 ===
-                    if args.loss_fct in ['dice', 'dice_focal', 'tversky', 'gdfl']:
-                        if seg_logits.shape[2:] != mask.shape[2:]:
-                            mask_resized = F.interpolate(mask.float(), size=seg_logits.shape[2:], mode="nearest")
-                        else:
-                            mask_resized = mask
-                        mask_resized = (mask_resized > 0).long()
-                        seg_loss = loss_fct(seg_logits.float(), mask_resized)
-                    else:
-                        target_bin = (mask > 0).float()
-                        if target_bin.ndim == 4:
-                            target_bin = target_bin.unsqueeze(1)
-                        if seg_logits.shape[2:] != target_bin.shape[2:]:
-                            target_bin = F.interpolate(target_bin, size=seg_logits.shape[2:], mode="nearest")
-                        if accelerator.is_local_main_process:
-                            print(f"Current Mask Sum: {mask.sum().item()}")
-                        seg_loss = loss_fct(seg_logits.float(), target_bin)
-
+                    seg_loss, seg_logits, _, ds_components = (
+                        weighted_segmentation_loss(
+                            seg_logits,
+                            mask,
+                            loss_fct,
+                            args.loss_fct,
+                            args.deep_supervision_weights,
+                        )
+                    )
                     loss = seg_loss
                     auxiliary_losses = {}
+                    if len(ds_components) > 1:
+                        for ds_index, ds_loss in enumerate(ds_components[1:], start=1):
+                            auxiliary_losses[f"deep_supervision_{ds_index}"] = ds_loss
                     if vision_seg_logits is not None:
-                        if args.loss_fct in ['dice', 'dice_focal', 'tversky', 'gdfl']:
-                            vision_seg_loss = loss_fct(
-                                vision_seg_logits.float(), mask_resized
-                            )
-                        else:
-                            vision_seg_loss = loss_fct(
-                                vision_seg_logits.float(), target_bin
-                            )
+                        (
+                            vision_seg_loss,
+                            vision_seg_logits,
+                            _,
+                            _,
+                        ) = weighted_segmentation_loss(
+                            vision_seg_logits,
+                            mask,
+                            loss_fct,
+                            args.loss_fct,
+                            args.deep_supervision_weights,
+                        )
                         loss = loss + args.vision_seg_weight * vision_seg_loss
                         auxiliary_losses["vision_seg"] = vision_seg_loss
 
                         if raw_fused_seg_logits is not None:
-                            if args.loss_fct in ['dice', 'dice_focal', 'tversky', 'gdfl']:
-                                raw_fused_seg_loss = loss_fct(
-                                    raw_fused_seg_logits.float(), mask_resized
-                                )
-                            else:
-                                raw_fused_seg_loss = loss_fct(
-                                    raw_fused_seg_logits.float(), target_bin
-                                )
+                            (
+                                raw_fused_seg_loss,
+                                raw_fused_seg_logits,
+                                _,
+                                _,
+                            ) = weighted_segmentation_loss(
+                                raw_fused_seg_logits,
+                                mask,
+                                loss_fct,
+                                args.loss_fct,
+                                args.deep_supervision_weights,
+                            )
                             loss = (
                                 loss
                                 + args.raw_fused_seg_weight * raw_fused_seg_loss
@@ -1225,6 +1345,9 @@ def main(args):
                             seg_logits = wavelet.reconstruction(logits_wt)
                         else:
                             seg_logits = logits_wt
+                        # Deep supervision is training-only; validation and
+                        # metrics always use the full-resolution final head.
+                        seg_logits = final_segmentation_logits(seg_logits)
 
                     # Validation loss
                     if args.loss_fct in ['dice', 'dice_focal', 'tversky', 'gdfl']:
