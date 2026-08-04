@@ -48,6 +48,7 @@ RAW_FUSED_SEG_WEIGHT="${RAW_FUSED_SEG_WEIGHT:-0.5}"
 SOFT_PROMPT_MODE="${SOFT_PROMPT_MODE:-learned}"
 TEXT_FEATURE_CACHE="${TEXT_FEATURE_CACHE:-}"
 EXPERIMENT_NAME_SUFFIX="${EXPERIMENT_NAME_SUFFIX:-}"
+STREAM_LOGS="${STREAM_LOGS:-0}"
 CFG_SCALE=1
 BASE_PORT="${BASE_PORT:-29600}"
 CHECK_IMAGE_PATHS="${CHECK_IMAGE_PATHS:-1}"
@@ -317,6 +318,14 @@ run_one() {
         fi
     fi
 
+    # Each run executes in its own background subshell. Redirect that subshell
+    # either to the log only or through tee for a single foreground-style job.
+    if [ "$STREAM_LOGS" = "1" ]; then
+        exec > >(tee "$log_path") 2>&1
+    else
+        exec >"$log_path" 2>&1
+    fi
+
     {
         echo "=========================================================="
         echo "[START] Train: $effective_name"
@@ -373,7 +382,7 @@ run_one() {
             --cfg_scale "$CFG_SCALE"
 
         echo "[DONE] Train: $effective_name"
-    } >"$log_path" 2>&1
+    }
 }
 
 for idx in "${!EXPERIMENTS[@]}"; do
