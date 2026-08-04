@@ -83,6 +83,12 @@ fi
 
 mkdir -p "$LOG_ROOT" "$CHECKPOINT_BASE"
 
+# Bash may continue reading a script while it runs. Use an immutable snapshot
+# so repository updates cannot shift the file offset of active launchers.
+BASE_LAUNCHER_SNAPSHOT="${LOG_ROOT}/run_train_dicom_ablation_snapshot.sh"
+cp "$BASE_LAUNCHER" "$BASE_LAUNCHER_SNAPSHOT"
+BASE_LAUNCHER="$BASE_LAUNCHER_SNAPSHOT"
+
 PIDS=()
 NAMES=()
 
@@ -102,6 +108,7 @@ launch_job() {
     fi
 
     echo "[LAUNCH] $job_name on GPU pair $gpu_pair -> $launcher_log"
+    echo "[TRAIN LOG] ${job_log_root}/${base_experiment}${suffix}.log"
     (
         PROJECT_DIR="$PROJECT_DIR" \
         GPU_PAIRS="$gpu_pair" \
@@ -114,6 +121,7 @@ launch_job() {
         CHECKPOINT_BASE="$CHECKPOINT_BASE" \
         LOG_ROOT="$job_log_root" \
         BASE_PORT="$port" \
+        STREAM_LOGS=0 \
         NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}" \
         NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}" \
         bash "$BASE_LAUNCHER"
