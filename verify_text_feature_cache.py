@@ -26,6 +26,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--atol", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--coverage-only",
+        action="store_true",
+        help="Check that every dataset prompt exists without loading the LLM.",
+    )
     return parser.parse_args()
 
 
@@ -33,6 +38,24 @@ def main() -> None:
     args = parse_args()
     cache = TextFeatureCache(args.cache, read_only=True)
     prompts = collect_prompts(args.csv)
+    missing = [prompt for prompt in prompts if not cache.contains(prompt)]
+    print(
+        f"[COVERAGE] required={len(prompts)} cache_entries={len(cache)} "
+        f"missing={len(missing)}"
+    )
+    if missing:
+        for prompt in missing[:5]:
+            print(f"[MISSING] {prompt[:200]}")
+        cache.close()
+        raise SystemExit(
+            "[FAIL] Cache coverage is incomplete. Rerun "
+            "precompute_text_features.py to append the missing prompts."
+        )
+    if args.coverage_only:
+        cache.close()
+        print("[PASS] Every dataset prompt is present in the cache.")
+        return
+
     random.Random(args.seed).shuffle(prompts)
     prompts = prompts[: min(args.samples, len(prompts))]
     device = torch.device(args.device)

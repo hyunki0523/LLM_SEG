@@ -11,6 +11,9 @@ PROJECT_DIR="${PROJECT_DIR:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk}"
 BASE_LAUNCHER="${BASE_LAUNCHER:-${PROJECT_DIR}/run_train_dicom_ablation_8gpu.sh}"
 GPU_PAIR="${GPU_PAIR:-0,1}"
 PYTHON_EXE="${PYTHON_EXE:-python}"
+TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
+VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
+LLM_REPO="${LLM_REPO:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf}"
 
 IFS=',' read -r -a gpu_list <<< "$GPU_PAIR"
 if [ "${#gpu_list[@]}" -ne 2 ] \
@@ -37,6 +40,12 @@ if [ ! -f "$TEXT_FEATURE_CACHE" ]; then
     echo "[ERROR] Text feature cache not found: $TEXT_FEATURE_CACHE"
     exit 2
 fi
+"$PYTHON_EXE" "${PROJECT_DIR}/verify_text_feature_cache.py" \
+    --csv "$TRAIN_CSV" \
+    --csv "$VALID_CSV" \
+    --llm-repo "$LLM_REPO" \
+    --cache "$TEXT_FEATURE_CACHE" \
+    --coverage-only
 
 CHECKPOINT_BASE="${CHECKPOINT_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v3a_4gpu_parallel}"
 LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/llama_safe_film_context_v3a_cached_ddp2_$(date +%Y%m%d_%H%M%S)}"
@@ -46,6 +55,9 @@ EXPECTED_GPUS=2 \
 "$PYTHON_EXE" "${PROJECT_DIR}/verify_runtime_environment.py"
 
 PROJECT_DIR="$PROJECT_DIR" \
+TRAIN_CSV="$TRAIN_CSV" \
+VALID_CSV="$VALID_CSV" \
+LLM_REPO="$LLM_REPO" \
 GPU_PAIRS="$GPU_PAIR" \
 NUM_PROCESSES_PER_JOB=2 \
 MAX_PARALLEL=1 \
