@@ -9,7 +9,11 @@ from pathlib import Path
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-from data.dataset import build_safe_clinical_prompt, read_dataset_table
+from data.dataset import (
+    _case_id_column,
+    build_safe_clinical_prompt,
+    read_dataset_table,
+)
 from model_custom.text_encoder import TextContextEncoder
 from model_custom.text_feature_cache import TextFeatureCache
 
@@ -18,6 +22,12 @@ def collect_prompts(csv_paths: list[str]) -> list[str]:
     prompts: set[str] = set()
     for csv_path in csv_paths:
         frame = read_dataset_table(csv_path)
+        # Match SegmentationDataset's data contract exactly.  The dataset keeps
+        # the first row for duplicate case IDs, while building a prompt dict
+        # directly from the raw frame would silently keep the last row.
+        frame = frame.drop_duplicates(
+            _case_id_column(frame), keep="first"
+        ).reset_index(drop=True)
         prompts.update(
             build_safe_clinical_prompt(
                 frame, ("extracted_cc", "chief_complaint")

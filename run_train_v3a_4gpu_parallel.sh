@@ -17,8 +17,18 @@ SMOKE_TEST="${SMOKE_TEST:-0}"
 BASE_PORT="${BASE_PORT:-29800}"
 
 read -r -a gpu_list <<< "$GPU_IDS"
-if [ "${#gpu_list[@]}" -ne 4 ]; then
-    echo "[ERROR] Explicitly set four GPU IDs, e.g. GPU_IDS='0 1 2 3'"
+if [ "${#gpu_list[@]}" -eq 1 ]; then
+    case "$V3A_4GPU_JOBS" in
+        vision_control|soft_prompt_online|no_soft_online|no_soft_cached) ;;
+        *)
+            echo "[ERROR] Single-GPU mode requires exactly one known V3A_4GPU_JOBS value."
+            exit 2
+            ;;
+    esac
+elif [ "${#gpu_list[@]}" -ne 4 ]; then
+    echo "[ERROR] Set either one GPU for one selected job or four GPUs for the full run."
+    echo "        Examples: GPU_IDS='3' V3A_4GPU_JOBS=no_soft_cached"
+    echo "                  GPU_IDS='0 1 2 3'"
     exit 2
 fi
 for gpu in "${gpu_list[@]}"; do
@@ -27,8 +37,8 @@ for gpu in "${gpu_list[@]}"; do
         exit 2
     fi
 done
-if [ "$(printf '%s\n' "${gpu_list[@]}" | sort -u | wc -l)" -ne 4 ]; then
-    echo "[ERROR] GPU_IDS must contain four distinct devices."
+if [ "$(printf '%s\n' "${gpu_list[@]}" | sort -u | wc -l)" -ne "${#gpu_list[@]}" ]; then
+    echo "[ERROR] GPU_IDS must contain distinct devices."
     exit 2
 fi
 if [ ! -f "$BASE_LAUNCHER" ]; then
@@ -43,7 +53,7 @@ fi
 
 selected_cuda_devices="$(IFS=,; echo "${gpu_list[*]}")"
 CUDA_VISIBLE_DEVICES="$selected_cuda_devices" \
-EXPECTED_GPUS=4 \
+EXPECTED_GPUS="${#gpu_list[@]}" \
 "$PYTHON_EXE" "${PROJECT_DIR}/verify_runtime_environment.py"
 
 # One GPU still uses the same effective batch as the former 2-GPU
@@ -110,10 +120,19 @@ launch_job() {
     NAMES+=("$job_name")
 }
 
-launch_job vision_control       "${gpu_list[0]}" vision_only learned  ""                    "$((BASE_PORT + 0))"
-launch_job soft_prompt_online   "${gpu_list[1]}" text_safe  learned  ""                    "$((BASE_PORT + 1))"
-launch_job no_soft_online       "${gpu_list[2]}" text_safe  disabled ""                    "$((BASE_PORT + 2))"
-launch_job no_soft_cached       "${gpu_list[3]}" text_safe  disabled "$TEXT_FEATURE_CACHE" "$((BASE_PORT + 3))"
+gpu_for_slot() {
+    local slot="$1"
+    if [ "${#gpu_list[@]}" -eq 1 ]; then
+        echo "${gpu_list[0]}"
+    else
+        echo "${gpu_list[$slot]}"
+    fi
+}
+
+launch_job vision_control       "$(gpu_for_slot 0)" vision_only learned  ""                    "$((BASE_PORT + 0))"
+launch_job soft_prompt_online   "$(gpu_for_slot 1)" text_safe  learned  ""                    "$((BASE_PORT + 1))"
+launch_job no_soft_online       "$(gpu_for_slot 2)" text_safe  disabled ""                    "$((BASE_PORT + 2))"
+launch_job no_soft_cached       "$(gpu_for_slot 3)" text_safe  disabled "$TEXT_FEATURE_CACHE" "$((BASE_PORT + 3))"
 
 if [ "${#PIDS[@]}" -eq 0 ]; then
     echo "[ERROR] V3A_4GPU_JOBS selected no known jobs: $V3A_4GPU_JOBS"
