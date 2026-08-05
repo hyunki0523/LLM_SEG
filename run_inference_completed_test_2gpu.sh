@@ -16,7 +16,7 @@ TEST_TEXT_CACHE="${TEST_TEXT_CACHE:-${PROJECT_DIR}/text_feature_cache/llama2_saf
 LOCAL_CACHE_DIR="${LOCAL_CACHE_DIR:-/tmp/llmseg_text_cache}"
 LOCAL_TEXT_CACHE="${LOCAL_TEXT_CACHE:-${LOCAL_CACHE_DIR}/$(basename "$TEST_TEXT_CACHE")}"
 RESULT_ROOT="${RESULT_ROOT:-/mnt/nas125/forGPU2/lhyunki/llmseg/inference_result/FUdata/completed_context_test_$(date +%Y%m%d_%H%M%S)}"
-SW_BATCH_SIZE="${SW_BATCH_SIZE:-8}"
+SW_BATCH_SIZE="${SW_BATCH_SIZE:-4}"
 PROB_THRESHOLD="${PROB_THRESHOLD:-0.5}"
 MIN_COMPONENT_VOXELS="${MIN_COMPONENT_VOXELS:-0}"
 BASE_PORT="${BASE_PORT:-29960}"
@@ -82,6 +82,7 @@ cp -f "$TEST_TEXT_CACHE" "$LOCAL_TEXT_CACHE"
 export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
 export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 export LLMSEG_FORCE_MATH_SDP="${LLMSEG_FORCE_MATH_SDP:-1}"
+export LLMSEG_FORCE_FP32_MHA="${LLMSEG_FORCE_FP32_MHA:-1}"
 
 for index in "${!NAMES[@]}"; do
     name="${NAMES[$index]}"
