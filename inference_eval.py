@@ -29,6 +29,8 @@ from tqdm.auto import tqdm
 from model_custom.stunet import get_stunet_base
 from model_custom.text_feature_cache import TextFeatureCache
 from data.dataset import (
+    DEFAULT_IMAGE_PATH_REWRITE_FROM,
+    DEFAULT_IMAGE_PATH_REWRITE_TO,
     build_safe_clinical_prompt,
     encode_dicom_row,
     windowing_3ch,
@@ -78,6 +80,33 @@ def load_image_3ch(img_path: Path):
     return torch.from_numpy(img).float(), itk
 
 
+def resolve_configured_image_path(raw_path: Path) -> Path:
+    """Apply the exact image-path rewrite used by the training dataset."""
+    raw = str(raw_path).strip()
+    original = Path(raw)
+    rewrite_from = os.environ.get(
+        "LLMSEG_IMAGE_PATH_REWRITE_FROM", DEFAULT_IMAGE_PATH_REWRITE_FROM
+    ).strip().rstrip("/\\")
+    rewrite_to = os.environ.get(
+        "LLMSEG_IMAGE_PATH_REWRITE_TO", DEFAULT_IMAGE_PATH_REWRITE_TO
+    ).strip().rstrip("/\\")
+    if bool(rewrite_from) ^ bool(rewrite_to):
+        raise ValueError(
+            "Set both LLMSEG_IMAGE_PATH_REWRITE_FROM and "
+            "LLMSEG_IMAGE_PATH_REWRITE_TO, or neither."
+        )
+    if rewrite_from and rewrite_to:
+        if raw == rewrite_from:
+            raw = rewrite_to
+        elif raw.startswith(rewrite_from + "/") or raw.startswith(rewrite_from + "\\"):
+            suffix = raw[len(rewrite_from):].lstrip("/\\")
+            raw = f"{rewrite_to}/{suffix}"
+    rewritten = Path(raw)
+    if rewritten != original and not rewritten.exists() and original.exists():
+        return original
+    return rewritten
+
+
 def find_case_image_path(case_id: str, fallback_path: Path = None) -> Path:
     test_image_dir = Path('/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/FUtest_data/image')
     for candidate in (
@@ -87,8 +116,15 @@ def find_case_image_path(case_id: str, fallback_path: Path = None) -> Path:
         if candidate.exists():
             return candidate
 
-    if fallback_path is not None and fallback_path.exists():
-        return fallback_path
+    if fallback_path is not None:
+        resolved_fallback = resolve_configured_image_path(fallback_path)
+        if resolved_fallback.exists():
+            return resolved_fallback
+    else:
+        resolved_fallback = None
+
+    if resolved_fallback is not None:
+        return resolved_fallback
 
     return Path('/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/pair_data_nifti') / f"{case_id}.nii.gz"
 
@@ -365,6 +401,36 @@ def main(args):
                 f"before distributed inference."
             )
             df = df.drop_duplicates(case_id_column, keep='first').reset_index(drop=True)
+
+        if 'image_path' in df.columns:
+            resolved_paths = []
+            missing_examples = []
+            for raw_path in df['image_path']:
+                if pd.isna(raw_path) or not str(raw_path).strip():
+                    resolved_paths.append(raw_path)
+                    if len(missing_examples) < 10:
+                        missing_examples.append("<empty image_path>")
+                    continue
+                resolved_path = resolve_configured_image_path(Path(str(raw_path).strip()))
+                resolved_paths.append(str(resolved_path))
+                if not resolved_path.exists() and len(missing_examples) < 10:
+                    missing_examples.append(str(resolved_path))
+            df['image_path'] = resolved_paths
+            missing_count = sum(
+                pd.isna(path) or not str(path).strip() or not Path(str(path)).exists()
+                for path in resolved_paths
+            )
+            accelerator.print(
+                f"[CHECK] Resolved image paths: {len(df) - missing_count}/{len(df)} exist."
+            )
+            if missing_count:
+                message = (
+                    f"{missing_count}/{len(df)} image files are missing after path rewrite. "
+                    f"Examples: {missing_examples}"
+                )
+                if args.fail_on_missing_images:
+                    raise FileNotFoundError(message)
+                accelerator.print(f"[WARN] {message}")
         
         total_len = len(df)
         accelerator.print(f"[INFO] Total cases in CSV/Excel: {total_len}")
@@ -994,6 +1060,12 @@ if __name__ == "__main__":
     parser.add_argument("--save_annotation_csv", action=argparse.BooleanOptionalAction, default=True, help="Save per-case annotation CSV under save_root")
     parser.add_argument("--annotation_csv_name", type=str, default="annotation.csv", help="Merged annotation CSV filename under save_root")
     parser.add_argument("--overwrite_annotation_csv", action=argparse.BooleanOptionalAction, default=True, help="Remove stale annotation CSV shards before this run")
+    parser.add_argument(
+        "--fail_on_missing_images",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Abort before loading the model if any CSV image_path is still missing after rewrite.",
+    )
     args = parser.parse_args()
     
     main(args)

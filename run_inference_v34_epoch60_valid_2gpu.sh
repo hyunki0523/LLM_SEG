@@ -88,6 +88,7 @@ for index in "${!NAMES[@]}"; do
         --context --soft_prompt_mode disabled --llm_repo "$LLM_REPO" \
         --text_feature_cache "$LOCAL_TEXT_CACHE" \
         --include_cc --include_chief_complaint \
+        --fail_on_missing_images \
         --overwrite_annotation_csv 2>&1 | tee "$log_path"
 done
 
