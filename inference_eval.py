@@ -354,6 +354,17 @@ def main(args):
             df = pd.read_excel(CSV_PATH, engine='openpyxl')
         else:
             df = pd.read_csv(CSV_PATH, sep=None, engine='python', encoding='utf-8-sig')
+
+        case_id_column = '영상일련번호ID'
+        if case_id_column not in df.columns:
+            raise KeyError(f"Missing required case ID column: {case_id_column}")
+        duplicate_count = int(df.duplicated(case_id_column, keep='first').sum())
+        if duplicate_count:
+            accelerator.print(
+                f"[WARN] Dropping {duplicate_count} duplicate case rows "
+                f"before distributed inference."
+            )
+            df = df.drop_duplicates(case_id_column, keep='first').reset_index(drop=True)
         
         total_len = len(df)
         accelerator.print(f"[INFO] Total cases in CSV/Excel: {total_len}")
