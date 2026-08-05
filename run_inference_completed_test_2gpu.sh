@@ -11,7 +11,7 @@ GPU_PAIR="${GPU_PAIR:-0,1}"
 TEST_CSV="${TEST_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_test_set_test2.xlsx}"
 V3A_BASE="${V3A_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v3a_4gpu_parallel}"
 V34_BASE="${V34_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v34_partial_ds}"
-LLM_REPO="${LLM_REPO:-${PROJECT_DIR}/model_custom/llama2/Llama-2-7b-chat-hf}"
+LLM_REPO="${LLM_REPO:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf}"
 TEST_TEXT_CACHE="${TEST_TEXT_CACHE:-${PROJECT_DIR}/text_feature_cache/llama2_safe_cc_nosoft_test.sqlite3}"
 LOCAL_CACHE_DIR="${LOCAL_CACHE_DIR:-/tmp/llmseg_text_cache}"
 LOCAL_TEXT_CACHE="${LOCAL_TEXT_CACHE:-${LOCAL_CACHE_DIR}/$(basename "$TEST_TEXT_CACHE")}"
@@ -37,7 +37,12 @@ CHECKPOINTS=(
     "${V34_BASE}/text_safe_v34_cached_control_ddp2/final_model.pth"
     "${V34_BASE}/text_safe_v34_cached_ds2_ddp2/final_model.pth"
 )
-for required in "$TEST_CSV" "${CHECKPOINTS[@]}"; do
+for required in \
+    "$TEST_CSV" \
+    "${LLM_REPO}/config.json" \
+    "${LLM_REPO}/model-00001-of-00002.safetensors" \
+    "${LLM_REPO}/model-00002-of-00002.safetensors" \
+    "${CHECKPOINTS[@]}"; do
     if [ ! -f "$required" ]; then
         echo "[ERROR] Required file not found: $required"
         exit 2

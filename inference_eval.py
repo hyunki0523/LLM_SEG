@@ -954,7 +954,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm_repo",
         type=str,
-        default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk/model_custom/llama2/Llama-2-7b-chat-hf/",
+        default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf/",
     )
     parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=False, help="Use PEFT LoRA for LLM backbone")
     parser.add_argument(
