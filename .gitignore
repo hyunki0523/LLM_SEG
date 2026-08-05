@@ -27,6 +27,7 @@ train_logs/
 text_feature_cache/
 inference_logs/
 inference_result/
+_eval_subsets/
 metric_results/
 wandb/
 _debug_ckpt/

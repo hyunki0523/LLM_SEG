@@ -27,6 +27,7 @@ sitk.ProcessObject.SetGlobalDefaultDirectionTolerance(1e-3)
 from tqdm.auto import tqdm
 
 from model_custom.stunet import get_stunet_base
+from model_custom.text_feature_cache import TextFeatureCache
 from data.dataset import (
     build_safe_clinical_prompt,
     encode_dicom_row,
@@ -38,6 +39,7 @@ from monai.metrics import DiceMetric, HausdorffDistanceMetric
 from monai.transforms import AsDiscrete
 from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from accelerate import Accelerator, InitProcessGroupKwargs
+from accelerate.utils import gather_object
 from datetime import timedelta
 import math
 from monai.transforms import AsDiscrete
@@ -206,6 +208,7 @@ def summarize_prediction_annotation(
     max_prob: Optional[float] = None,
     prob_threshold: Optional[float] = None,
     post_info: Optional[Dict[str, object]] = None,
+    case_metrics: Optional[Dict[str, object]] = None,
     prediction_source: str = "new_inference",
 ) -> Dict[str, object]:
     pred_bin = (pred_bin_np > 0).astype(np.uint8)
@@ -271,7 +274,7 @@ def summarize_prediction_annotation(
     subclass_label = _row_text(row, ["subclass", "Subclass"], default="")
     cc_text = _row_text(row, ["extracted_cc", "chief_complaint", "CC", "cc"], default="")
 
-    return {
+    record = {
         "Patient_ID": patient_id,
         "case_id": case_id,
         "class": class_label,
@@ -295,6 +298,9 @@ def summarize_prediction_annotation(
         "pred_path": str(pred_path) if pred_path else "",
         "prediction_source": prediction_source,
     }
+    if case_metrics:
+        record.update(case_metrics)
+    return record
 
 
 # ==========================================
@@ -422,6 +428,25 @@ def main(args):
                 "[INFO] Auto-detected soft_prompt_mode="
                 f"{soft_prompt_mode} from checkpoint keys."
             )
+        text_feature_cache = None
+        cached_text_dim = 4096
+        if args.text_feature_cache:
+            if not args.context:
+                raise ValueError("--text_feature_cache requires --context.")
+            if soft_prompt_mode != "disabled":
+                raise ValueError(
+                    "--text_feature_cache requires a no-soft-prompt checkpoint."
+                )
+            text_feature_cache = TextFeatureCache(
+                args.text_feature_cache, read_only=True
+            )
+            cached_text_dim = int(
+                text_feature_cache.metadata.get("hidden_dim", 4096)
+            )
+            accelerator.print(
+                f"[TEXT CACHE] entries={len(text_feature_cache)} "
+                f"hidden_dim={cached_text_dim} path={args.text_feature_cache}"
+            )
         model = get_stunet_base(
             num_input_channels=3,
             num_classes=detected_num_classes,   
@@ -430,6 +455,8 @@ def main(args):
             llm_repo=llm_repo,
             use_lora=getattr(args, 'use_lora', False),
             soft_prompt_mode=soft_prompt_mode,
+            use_cached_text_features=text_feature_cache is not None,
+            cached_text_dim=cached_text_dim,
             use_dicom=args.use_dicom,
             dicom_numeric_dim=10,
             dicom_category_sizes=(
@@ -560,10 +587,11 @@ def main(args):
             has_gt = mask_path is not None and mask_path.exists()
             if not has_gt and accelerator.is_main_process:
                 tqdm.write(f"[WARN] Missing mask file for {case_id}. Prediction will be saved without online GT metrics.")
-                
+
             img_t, itk_ref = load_image_3ch(img_path)
             
             ctx_ids, attn_mask = None, None
+            cached_text_features, cached_text_mask = None, None
             if args.context:
                 ctx_txt = prompt_map.get(case_id, "<SEG>")
                 
@@ -585,7 +613,14 @@ def main(args):
                         clean_soft = str(global_nearest_words).replace('"', '""')
                         f.write(f'"{case_id}","{clean_ctx}","{clean_soft}"\n')
 
-                ctx_ids, attn_mask = make_context_tokens(model, ctx_txt, device)
+                if text_feature_cache is not None:
+                    cached_text_features, cached_text_mask = (
+                        text_feature_cache.get_batch([ctx_txt], device)
+                    )
+                else:
+                    ctx_ids, attn_mask = make_context_tokens(
+                        model, ctx_txt, device
+                    )
 
             dicom_numeric, dicom_categorical = None, None
             if args.use_dicom:
@@ -611,6 +646,14 @@ def main(args):
                         attn_mask=(
                             attn_mask.expand(x.shape[0], -1)
                             if attn_mask is not None else None
+                        ),
+                        precomputed_text_features=(
+                            cached_text_features.expand(x.shape[0], -1, -1)
+                            if cached_text_features is not None else None
+                        ),
+                        precomputed_text_mask=(
+                            cached_text_mask.expand(x.shape[0], -1)
+                            if cached_text_mask is not None else None
                         ),
                         dicom_numeric=(
                             dicom_numeric.expand(x.shape[0], -1)
@@ -657,6 +700,7 @@ def main(args):
             pred_onehot[0, 0] = 1.0 - pred_onehot[0, 1]
              
             gt_is_positive = None
+            case_metrics = {}
             if has_gt:
                 # Ground Truth Loading
                 try:
@@ -679,6 +723,32 @@ def main(args):
                 # ── GT 출혈 여부 판단 ──
                 gt_bin_np = gt_onehot[0, 1].cpu().numpy()
                 gt_is_positive = gt_bin_np.sum() > 0
+                pred_bool = pred_bin_np.astype(bool)
+                gt_bool = gt_bin_np.astype(bool)
+                pred_voxels = int(pred_bool.sum())
+                gt_voxels = int(gt_bool.sum())
+                tp = int(np.logical_and(pred_bool, gt_bool).sum())
+                fp = int(np.logical_and(pred_bool, np.logical_not(gt_bool)).sum())
+                fn = int(np.logical_and(np.logical_not(pred_bool), gt_bool).sum())
+                dice_denominator = pred_voxels + gt_voxels
+                case_metrics = {
+                    "gt_is_positive": bool(gt_is_positive),
+                    "gt_voxels": gt_voxels,
+                    "pred_voxels": pred_voxels,
+                    "tp_voxels": tp,
+                    "fp_voxels": fp,
+                    "fn_voxels": fn,
+                    "case_dice": (
+                        2.0 * tp / dice_denominator
+                        if dice_denominator > 0 else 1.0
+                    ),
+                    "case_sensitivity": (
+                        tp / (tp + fn + 1e-6) if gt_voxels > 0 else ""
+                    ),
+                    "normal_no_fp": (
+                        "" if gt_is_positive else float(pred_voxels == 0)
+                    ),
+                }
 
                 # ── MONAI Metrics: 출혈 케이스만 집계 (정상군 Dice=NaN 오염 방지) ──
                 if gt_is_positive:
@@ -686,8 +756,6 @@ def main(args):
                     hd95_metric(y_pred=pred_onehot, y=gt_onehot)
                     n_positive += 1
 
-                    tp = np.logical_and(pred_bin_np, gt_bin_np).sum()
-                    fn = np.logical_and(np.logical_not(pred_bin_np), gt_bin_np).sum()
                     sens = tp / (tp + fn + 1e-6)
                     sens_list_positive.append(sens)
                 else:
@@ -753,6 +821,7 @@ def main(args):
                         max_prob=float(np.max(hemo_prob)),
                         prob_threshold=prob_threshold,
                         post_info=post_info,
+                        case_metrics=case_metrics,
                         prediction_source="new_inference",
                     )
                 )
@@ -784,31 +853,81 @@ def main(args):
                 annotation_df.to_csv(annotation_path, index=False, encoding='utf-8-sig')
                 accelerator.print(f"[INFO] Saved annotation CSV: {annotation_path} ({len(annotation_df)} cases)")
 
-        print("\n" + "="*60)
-        print(f"💡 INFERENCE EVALUATION SUMMARY [Process {accelerator.process_index}]")
-        print("="*60)
-        print(f"Total Processed : {processed}  (ICH: {n_positive}, Normal: {n_normal}, No GT: {n_unlabeled})")
-        print(f"─"*60)
-        print(f"Hemorrhage Cases Only ({n_positive} cases)")
-        try:
-            final_dice = dice_metric.aggregate().item()
-            final_hd95 = hd95_metric.aggregate().item()
-            mean_sens_ich = np.mean(sens_list_positive) if sens_list_positive else float('nan')
-            print(f"  - Mean Dice (MONAI, ICH only):  {final_dice:.4f}")
-            print(f"  - Mean Sensitivity (ICH voxel): {mean_sens_ich:.4f}")
-            print(f"  - Mean HD95 (MONAI, ICH only):  {final_hd95:.2f} mm")
-        except ValueError:
-            print("  - Mean Dice : N/A (no positive cases evaluated)")
-            print("  - Mean Sensitivity : N/A")
-            print("  - Mean HD95 : N/A")
-        print(f"─"*60)
-        print(f"Normal Cases ({n_normal} cases) — specificity proxy")
-        if sens_list_normal:
-            specificity = np.mean(sens_list_normal)   # TN/(TN+FP) per case average
-            print(f"  - Mean Specificity (no FP rate): {specificity:.4f}")
-        else:
-            print("  - N/A")
-        print("="*60)
+        def metric_buffer_values(metric):
+            buffer = metric.get_buffer()
+            if buffer is None:
+                return []
+            return buffer.detach().float().cpu().reshape(-1).tolist()
+
+        local_summary = {
+            "processed": processed,
+            "n_positive": n_positive,
+            "n_normal": n_normal,
+            "n_unlabeled": n_unlabeled,
+            "dice_positive": metric_buffer_values(dice_metric),
+            "hd95_positive_mm": metric_buffer_values(hd95_metric),
+            "sensitivity_positive": [float(v) for v in sens_list_positive],
+            "normal_no_fp": [float(v) for v in sens_list_normal],
+        }
+        gathered_summaries = gather_object([local_summary])
+
+        if text_feature_cache is not None:
+            text_feature_cache.close()
+
+        if accelerator.is_main_process:
+            summaries = [item for item in gathered_summaries if isinstance(item, dict)]
+
+            def merged_values(name):
+                values = []
+                for summary_part in summaries:
+                    values.extend(summary_part.get(name, []))
+                return values
+
+            def finite_mean(values):
+                values = np.asarray(values, dtype=np.float64)
+                values = values[np.isfinite(values)]
+                return float(values.mean()) if values.size else None
+
+            dice_values = merged_values("dice_positive")
+            hd95_values = merged_values("hd95_positive_mm")
+            sens_values = merged_values("sensitivity_positive")
+            normal_values = merged_values("normal_no_fp")
+            summary = {
+                "model_path": str(args.model_path),
+                "csv_path": str(args.csv_path),
+                "world_size": accelerator.num_processes,
+                "processed": sum(int(s.get("processed", 0)) for s in summaries),
+                "n_positive": sum(int(s.get("n_positive", 0)) for s in summaries),
+                "n_normal": sum(int(s.get("n_normal", 0)) for s in summaries),
+                "n_unlabeled": sum(int(s.get("n_unlabeled", 0)) for s in summaries),
+                "mean_dice_positive": finite_mean(dice_values),
+                "mean_sensitivity_positive": finite_mean(sens_values),
+                "mean_hd95_positive_mm": finite_mean(hd95_values),
+                "hd95_finite_cases": int(np.isfinite(np.asarray(hd95_values)).sum()),
+                "normal_no_fp_rate": finite_mean(normal_values),
+            }
+            summary_path = save_root / "evaluation_summary.json"
+            with summary_path.open("w", encoding="utf-8") as f:
+                json.dump(summary, f, ensure_ascii=False, indent=2)
+
+            def show(value, digits=4):
+                return "N/A" if value is None else f"{value:.{digits}f}"
+
+            print("\n" + "="*60)
+            print("INFERENCE EVALUATION SUMMARY [all processes]")
+            print("="*60)
+            print(
+                f"Total Processed : {summary['processed']}  "
+                f"(ICH: {summary['n_positive']}, Normal: {summary['n_normal']}, "
+                f"No GT: {summary['n_unlabeled']})"
+            )
+            print("─"*60)
+            print(f"  - Mean Dice (ICH only):         {show(summary['mean_dice_positive'])}")
+            print(f"  - Mean Sensitivity (ICH voxel): {show(summary['mean_sensitivity_positive'])}")
+            print(f"  - Mean HD95 (finite cases):     {show(summary['mean_hd95_positive_mm'], 2)} mm")
+            print(f"  - Normal no-FP rate:            {show(summary['normal_no_fp_rate'])}")
+            print(f"  - Summary JSON:                 {summary_path}")
+            print("="*60)
         
     except Exception as e:
         print("\n[EXCEPTION] Script crashed:")
@@ -824,7 +943,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm_repo",
         type=str,
-        default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf/",
+        default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk/model_custom/llama2/Llama-2-7b-chat-hf/",
     )
     parser.add_argument("--use_lora", action=argparse.BooleanOptionalAction, default=False, help="Use PEFT LoRA for LLM backbone")
     parser.add_argument(
@@ -832,6 +951,12 @@ if __name__ == "__main__":
         choices=["learned", "disabled"],
         default=None,
         help="Override soft-prompt mode; default auto-detects from checkpoint.",
+    )
+    parser.add_argument(
+        "--text_feature_cache",
+        type=str,
+        default=None,
+        help="Read-only SQLite cache for no-soft-prompt context inference.",
     )
     parser.add_argument("--patch_size", type=int, nargs=3, default=[32, 224, 224])
     parser.add_argument("--device", type=int, default=0)
