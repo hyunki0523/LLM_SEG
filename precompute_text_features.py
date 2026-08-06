@@ -16,7 +16,7 @@ from data.dataset import (
     read_dataset_table,
 )
 from model_custom.text_encoder import TextContextEncoder
-from model_custom.text_feature_cache import TextFeatureCache
+from model_custom.text_feature_cache import TextFeatureCache, text_cache_key
 
 
 def collect_prompts(
@@ -164,7 +164,18 @@ def main() -> None:
                 "Skip-cache DICOM prompt mode mismatch: "
                 f"cache={existing_mode}, requested={args.dicom_prompt_mode}."
             )
-        prompts = [prompt for prompt in prompts if not existing_cache.contains(prompt)]
+        # A contains() call per prompt becomes tens of thousands of random
+        # SQLite reads per worker. That is prohibitively slow when six workers
+        # share a cache on NAS. Read the compact key column once instead.
+        existing_keys = {
+            row[0]
+            for row in existing_cache.connection.execute(
+                "SELECT cache_key FROM features"
+            ).fetchall()
+        }
+        prompts = [
+            prompt for prompt in prompts if text_cache_key(prompt) not in existing_keys
+        ]
         skipped_existing = len(all_prompts) - len(prompts)
         existing_cache.close()
     remaining_before_shard = len(prompts)
@@ -172,7 +183,8 @@ def main() -> None:
     print(
         f"[CACHE] unique={len(all_prompts)} skipped_existing={skipped_existing} "
         f"remaining={remaining_before_shard} shard={args.shard_index}/{args.num_shards} "
-        f"shard_prompts={len(prompts)} dicom_prompt_mode={args.dicom_prompt_mode}"
+        f"shard_prompts={len(prompts)} dicom_prompt_mode={args.dicom_prompt_mode}",
+        flush=True,
     )
 
     tokenizer, encoder, hidden_dim = load_frozen_text_encoder(
@@ -214,7 +226,15 @@ def main() -> None:
     else:
         cache.set_metadata(expected_metadata)
 
-    pending = [prompt for prompt in prompts if not cache.contains(prompt)]
+    shard_existing_keys = {
+        row[0]
+        for row in cache.connection.execute(
+            "SELECT cache_key FROM features"
+        ).fetchall()
+    }
+    pending = [
+        prompt for prompt in prompts if text_cache_key(prompt) not in shard_existing_keys
+    ]
     print(
         f"[CACHE] existing={len(cache)} pending={len(pending)} "
         f"output={cache.path}"

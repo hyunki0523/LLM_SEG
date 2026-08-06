@@ -64,7 +64,7 @@ for index in "${!gpu_list[@]}"; do
     SHARDS+=("$shard_path")
     echo "[LAUNCH] shard=$index/$num_shards GPU=$gpu log=$shard_log"
     (
-        CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_EXE" precompute_text_features.py \
+        PYTHONUNBUFFERED=1 CUDA_VISIBLE_DEVICES="$gpu" "$PYTHON_EXE" -u precompute_text_features.py \
             --csv "$TRAIN_CSV" --csv "$VALID_CSV" \
             --llm-repo "$LLM_REPO" \
             --output "$shard_path" \
