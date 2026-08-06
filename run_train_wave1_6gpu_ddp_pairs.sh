@@ -19,6 +19,8 @@ CHECKPOINT_BASE="${CHECKPOINT_BASE:-/mnt/nas125/forGPU2/lhyunki/llmseg/experimen
 SMOKE_TEST="${SMOKE_TEST:-0}"
 BASE_PORT="${BASE_PORT:-30100}"
 BUILD_MISSING_CACHE="${BUILD_MISSING_CACHE:-1}"
+PARALLEL_CACHE_BUILD="${PARALLEL_CACHE_BUILD:-1}"
+CACHE_GPU_IDS="${CACHE_GPU_IDS:-$GPU_IDS}"
 
 SHARED_CACHE_DIR="${SHARED_CACHE_DIR:-${PROJECT_DIR}/text_feature_cache}"
 CC_CACHE_SHARED="${CC_CACHE_SHARED:-${SHARED_CACHE_DIR}/llama2_safe_cc_nosoft.sqlite3}"
@@ -125,14 +127,25 @@ ensure_cache() {
         echo "[ERROR] Missing/incomplete cache and BUILD_MISSING_CACHE=0: $cache_path"
         exit 1
     fi
-    echo "[CACHE] Building/updating mode=$mode cache on physical GPU ${gpu_list[0]}: $cache_path"
-    CUDA_VISIBLE_DEVICES="${gpu_list[0]}" "$PYTHON_EXE" precompute_text_features.py \
-        --csv "$TRAIN_CSV" --csv "$VALID_CSV" \
-        --llm-repo "$LLM_REPO" \
-        --output "$cache_path" \
-        --dicom-prompt-mode "$mode" \
-        --batch-size "${CACHE_BATCH_SIZE:-8}" \
-        --device cuda:0
+    echo "[CACHE] Building/updating mode=$mode cache: $cache_path"
+    read -r -a cache_gpu_list <<< "$CACHE_GPU_IDS"
+    if [ "$PARALLEL_CACHE_BUILD" = "1" ] && [ "${#cache_gpu_list[@]}" -gt 1 ]; then
+        echo "[CACHE] Parallel encoding on GPUs: $CACHE_GPU_IDS"
+        PROJECT_DIR="$PROJECT_DIR" PYTHON_EXE="$PYTHON_EXE" \
+        GPU_IDS="$CACHE_GPU_IDS" TRAIN_CSV="$TRAIN_CSV" VALID_CSV="$VALID_CSV" \
+        LLM_REPO="$LLM_REPO" DICOM_PROMPT_MODE="$mode" TARGET_CACHE="$cache_path" \
+        CACHE_BATCH_SIZE="${CACHE_BATCH_SIZE:-8}" \
+        LOG_ROOT="${LOG_ROOT}/cache_build_${mode}" \
+        bash "${PROJECT_DIR}/precompute_text_features_multi_gpu.sh"
+    else
+        CUDA_VISIBLE_DEVICES="${gpu_list[0]}" "$PYTHON_EXE" precompute_text_features.py \
+            --csv "$TRAIN_CSV" --csv "$VALID_CSV" \
+            --llm-repo "$LLM_REPO" \
+            --output "$cache_path" \
+            --dicom-prompt-mode "$mode" \
+            --batch-size "${CACHE_BATCH_SIZE:-8}" \
+            --device cuda:0
+    fi
     "$PYTHON_EXE" verify_text_feature_cache.py "${verify_args[@]}"
 }
 

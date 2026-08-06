@@ -130,6 +130,13 @@ def parse_args() -> argparse.Namespace:
         choices=sorted(DICOM_PROMPT_FIELD_MODES),
         help="Allow-listed DICOM fields serialized into each safe prompt.",
     )
+    parser.add_argument(
+        "--skip-cache",
+        default=None,
+        help="Existing cache whose prompts are excluded before deterministic sharding.",
+    )
+    parser.add_argument("--num-shards", type=int, default=1)
+    parser.add_argument("--shard-index", type=int, default=0)
     return parser.parse_args()
 
 
@@ -137,11 +144,35 @@ def main() -> None:
     args = parse_args()
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive.")
+    if args.num_shards < 1:
+        raise ValueError("--num-shards must be positive.")
+    if not 0 <= args.shard_index < args.num_shards:
+        raise ValueError("--shard-index must satisfy 0 <= index < num_shards.")
+    if args.skip_cache and Path(args.skip_cache).resolve() == Path(args.output).resolve():
+        raise ValueError("--skip-cache and --output must be different files.")
     device = torch.device(args.device)
-    prompts = collect_prompts(args.csv, args.dicom_prompt_mode)
+    all_prompts = collect_prompts(args.csv, args.dicom_prompt_mode)
+    prompts = all_prompts
+    skipped_existing = 0
+    if args.skip_cache and Path(args.skip_cache).is_file():
+        existing_cache = TextFeatureCache(args.skip_cache, read_only=True)
+        existing_mode = str(
+            existing_cache.metadata.get("dicom_prompt_mode", "none")
+        ).lower()
+        if existing_mode != args.dicom_prompt_mode:
+            raise ValueError(
+                "Skip-cache DICOM prompt mode mismatch: "
+                f"cache={existing_mode}, requested={args.dicom_prompt_mode}."
+            )
+        prompts = [prompt for prompt in prompts if not existing_cache.contains(prompt)]
+        skipped_existing = len(all_prompts) - len(prompts)
+        existing_cache.close()
+    remaining_before_shard = len(prompts)
+    prompts = prompts[args.shard_index :: args.num_shards]
     print(
-        f"[CACHE] unique safe prompts: {len(prompts)} "
-        f"dicom_prompt_mode={args.dicom_prompt_mode}"
+        f"[CACHE] unique={len(all_prompts)} skipped_existing={skipped_existing} "
+        f"remaining={remaining_before_shard} shard={args.shard_index}/{args.num_shards} "
+        f"shard_prompts={len(prompts)} dicom_prompt_mode={args.dicom_prompt_mode}"
     )
 
     tokenizer, encoder, hidden_dim = load_frozen_text_encoder(
