@@ -170,6 +170,7 @@ export LLMSEG_FORCE_MATH_SDP="${LLMSEG_FORCE_MATH_SDP:-1}"
 # CUBLAS_STATUS_INTERNAL_ERROR on this cu132 Blackwell build. Limit FP32 to the
 # small concept-query and spatial-to-concept attention operations.
 export LLMSEG_FORCE_FP32_MHA="${LLMSEG_FORCE_FP32_MHA:-1}"
+export LLMSEG_SOFT_PROMPT_MASK_POSITION_IDS="${LLMSEG_SOFT_PROMPT_MASK_POSITION_IDS:-0}"
 # This stack was stable with CUDA P2P and CUDA-memory transport disabled.
 # Single-GPU v3a jobs are unaffected; multi-GPU callers may override after
 # separately validating NCCL on their exact driver/runtime combination.
@@ -225,6 +226,7 @@ echo "[INFO] DEEP_SUPERVISION_WEIGHTS=$DEEP_SUPERVISION_WEIGHTS"
 echo "[INFO] LLM_ATTN_IMPLEMENTATION=$LLM_ATTN_IMPLEMENTATION"
 echo "[INFO] LLMSEG_FORCE_MATH_SDP=$LLMSEG_FORCE_MATH_SDP"
 echo "[INFO] LLMSEG_FORCE_FP32_MHA=$LLMSEG_FORCE_FP32_MHA"
+echo "[INFO] LLMSEG_SOFT_PROMPT_MASK_POSITION_IDS=$LLMSEG_SOFT_PROMPT_MASK_POSITION_IDS"
 echo "[INFO] NCCL_P2P_DISABLE=$NCCL_P2P_DISABLE"
 echo "[INFO] NCCL_CUMEM_ENABLE=$NCCL_CUMEM_ENABLE"
 echo "[INFO] CHECK_IMAGE_PATHS=$CHECK_IMAGE_PATHS"

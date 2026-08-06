@@ -823,7 +823,12 @@ class STUNet(nn.Module):
                     report_in.to(x.device),
                     self.contexts,
                     attn_mask=attn_mask,
-                    position_ids_from_mask=self.soft_prompt_mode == "disabled",
+                    position_ids_from_mask=(
+                        self.soft_prompt_mode == "disabled"
+                        or os.environ.get(
+                            "LLMSEG_SOFT_PROMPT_MASK_POSITION_IDS", "0"
+                        ) == "1"
+                    ),
                 )
             if emb_txt is not None:
                 concepts, concept_attention = self.concept_extractor(
