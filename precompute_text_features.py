@@ -126,6 +126,12 @@ def load_frozen_text_encoder(
     encoder.seg_token_initialization = seg_token_initialization
     encoder.seg_token_id = seg_token_id
     encoder.seg_embedding_sha256 = hashlib.sha256(seg_embedding).hexdigest()
+    print(
+        f"[CACHE] <SEG> token_id={seg_token_id} "
+        f"initialization={seg_token_initialization} "
+        f"sha256={encoder.seg_embedding_sha256}",
+        flush=True,
+    )
     return tokenizer, encoder, hidden_dim
 
 
