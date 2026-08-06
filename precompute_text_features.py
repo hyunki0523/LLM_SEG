@@ -55,7 +55,10 @@ def deterministically_resize_token_embeddings(model, tokenizer) -> str:
 def collect_prompts(
     csv_paths: list[str], dicom_prompt_mode: str = "none"
 ) -> list[str]:
-    prompts: set[str] = set()
+    # Keep an explicit empty-context control in every cache.  It is used by
+    # post-hoc text ablations and avoids loading the 7B encoder only to encode
+    # a single control prompt later.
+    prompts: set[str] = {"<SEG>"}
     for csv_path in csv_paths:
         frame = read_dataset_table(csv_path)
         # Match SegmentationDataset's data contract exactly.  The dataset keeps

@@ -241,6 +241,7 @@ def summarize_prediction_annotation(
     pred_bin_np: np.ndarray,
     ref_img: sitk.Image,
     pred_path: Optional[Path] = None,
+    probability_path: Optional[Path] = None,
     max_prob: Optional[float] = None,
     prob_threshold: Optional[float] = None,
     post_info: Optional[Dict[str, object]] = None,
@@ -332,6 +333,7 @@ def summarize_prediction_annotation(
         "post_removed_voxels": post_info.get("removed_voxels", ""),
         "post_removed_components": post_info.get("removed_components", ""),
         "pred_path": str(pred_path) if pred_path else "",
+        "probability_path": str(probability_path) if probability_path else "",
         "prediction_source": prediction_source,
     }
     if case_metrics:
@@ -790,6 +792,25 @@ def main(args):
                 hemo_prob = torch.softmax(logits, dim=0)[1].float().cpu().numpy()
                 pred_bin_np = (hemo_prob >= prob_threshold).astype(np.uint8)
 
+            probability_path = None
+            if getattr(args, "save_probabilities", False):
+                probability_dir = save_root / case_id
+                probability_dir.mkdir(parents=True, exist_ok=True)
+                probability_path = probability_dir / "hemo_probability.npy"
+                temporary_probability_path = probability_dir / "hemo_probability.tmp"
+                probability_dtype = (
+                    np.float16
+                    if getattr(args, "probability_dtype", "float16") == "float16"
+                    else np.float32
+                )
+                with temporary_probability_path.open("wb") as probability_file:
+                    np.save(
+                        probability_file,
+                        hemo_prob.astype(probability_dtype, copy=False),
+                        allow_pickle=False,
+                    )
+                os.replace(temporary_probability_path, probability_path)
+
             pred_bin_np, post_info = remove_small_connected_components(
                 pred_bin_np,
                 min_voxels=getattr(args, 'min_component_voxels', 0),
@@ -834,6 +855,11 @@ def main(args):
                 fn = int(np.logical_and(np.logical_not(pred_bool), gt_bool).sum())
                 dice_denominator = pred_voxels + gt_voxels
                 case_metrics = {
+                    "image_path": str(img_path),
+                    "gt_mask_path": str(mask_path),
+                    "spacing_x_mm": float(itk_ref.GetSpacing()[0]),
+                    "spacing_y_mm": float(itk_ref.GetSpacing()[1]),
+                    "spacing_z_mm": float(itk_ref.GetSpacing()[2]),
                     "gt_is_positive": bool(gt_is_positive),
                     "gt_voxels": gt_voxels,
                     "pred_voxels": pred_voxels,
@@ -920,6 +946,7 @@ def main(args):
                         pred_bin_np,
                         itk_ref,
                         pred_path=annotation_pred_path,
+                        probability_path=probability_path,
                         max_prob=float(np.max(hemo_prob)),
                         prob_threshold=prob_threshold,
                         post_info=post_info,
@@ -1073,6 +1100,22 @@ if __name__ == "__main__":
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--mixed_precision", type=str, default='bf16', help="fp16 or bf16")
     parser.add_argument("--save_pred", action=argparse.BooleanOptionalAction, default=True, help="Save resulting NIfTI files")
+    parser.add_argument(
+        "--save_probabilities",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "Save the foreground probability volume once per case as a NumPy "
+            "array. This enables CPU-only post-hoc threshold/suppression sweeps "
+            "without repeating 3D model inference."
+        ),
+    )
+    parser.add_argument(
+        "--probability_dtype",
+        choices=["float16", "float32"],
+        default="float16",
+        help="Storage dtype used by --save_probabilities.",
+    )
     parser.add_argument("--sw_batch_size", type=int, default=1, help="Number of sliding window patches to batch together (increase for more VRAM utilization)")
     parser.add_argument("--cfg_scale", type=float, default=1.0,
                         help="Deprecated compatibility option; CFG is disabled.")
