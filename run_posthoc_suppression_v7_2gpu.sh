@@ -96,6 +96,7 @@ if [ "$SKIP_VISION_INFERENCE" != "1" ]; then
         --no-context \
         --no-save_pred \
         --save_probabilities \
+        --save_labeled_probabilities_only \
         --probability_dtype float16 \
         --prob_threshold 0.5 \
         --fail_on_missing_images \

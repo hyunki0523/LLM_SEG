@@ -45,8 +45,9 @@ python precompute_text_features.py \
 
 ## Full two-GPU run
 
-The vision checkpoint is inferred once. FP16 probability volumes are then reused
-for every CPU suppression condition.
+The vision checkpoint is inferred once. FP16 probability volumes for labeled
+validation cases are then reused for every CPU suppression condition; unlabeled
+cases do not consume probability-map storage.
 
 ```bash
 cd /mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk

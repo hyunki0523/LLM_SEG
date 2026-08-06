@@ -793,7 +793,10 @@ def main(args):
                 pred_bin_np = (hemo_prob >= prob_threshold).astype(np.uint8)
 
             probability_path = None
-            if getattr(args, "save_probabilities", False):
+            if getattr(args, "save_probabilities", False) and (
+                has_gt
+                or not getattr(args, "save_labeled_probabilities_only", False)
+            ):
                 probability_dir = save_root / case_id
                 probability_dir.mkdir(parents=True, exist_ok=True)
                 probability_path = probability_dir / "hemo_probability.npy"
@@ -1115,6 +1118,15 @@ if __name__ == "__main__":
         choices=["float16", "float32"],
         default="float16",
         help="Storage dtype used by --save_probabilities.",
+    )
+    parser.add_argument(
+        "--save_labeled_probabilities_only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "With --save_probabilities, retain volumes only for cases with a "
+            "resolved GT mask. Useful for validation sweeps with large volumes."
+        ),
     )
     parser.add_argument("--sw_batch_size", type=int, default=1, help="Number of sliding window patches to batch together (increase for more VRAM utilization)")
     parser.add_argument("--cfg_scale", type=float, default=1.0,
