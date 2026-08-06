@@ -53,6 +53,8 @@ EXPERIMENT_NAME_SUFFIX="${EXPERIMENT_NAME_SUFFIX:-}"
 STREAM_LOGS="${STREAM_LOGS:-0}"
 DEEP_SUPERVISION="${DEEP_SUPERVISION:-0}"
 DEEP_SUPERVISION_WEIGHTS="${DEEP_SUPERVISION_WEIGHTS:-1.0,0.3,0.1}"
+USE_EMA="${USE_EMA:-1}"
+EMA_DECAY="${EMA_DECAY:-0.999}"
 CFG_SCALE=1
 BASE_PORT="${BASE_PORT:-29600}"
 CHECK_IMAGE_PATHS="${CHECK_IMAGE_PATHS:-1}"
@@ -209,6 +211,8 @@ echo "[INFO] TEXT_FUSION_TRANSITION_EPOCHS=$TEXT_FUSION_TRANSITION_EPOCHS"
 echo "[INFO] CONTEXT_INITIAL_ALPHA=$CONTEXT_INITIAL_ALPHA"
 echo "[INFO] CONTEXT_MIN_ALPHA=$CONTEXT_MIN_ALPHA"
 echo "[INFO] RAW_FUSED_SEG_WEIGHT=$RAW_FUSED_SEG_WEIGHT"
+echo "[INFO] USE_EMA=$USE_EMA"
+echo "[INFO] EMA_DECAY=$EMA_DECAY"
 echo "[INFO] SOFT_PROMPT_MODE=$SOFT_PROMPT_MODE"
 echo "[INFO] TEXT_FEATURE_CACHE=${TEXT_FEATURE_CACHE:-<online>}"
 echo "[INFO] EXPERIMENT_NAME_SUFFIX=${EXPERIMENT_NAME_SUFFIX:-<none>}"
@@ -309,6 +313,12 @@ run_one() {
     else
         deep_supervision_args=(--no-deep_supervision)
     fi
+    local ema_args
+    if [ "$USE_EMA" = "1" ]; then
+        ema_args=(--use_ema --ema_decay "$EMA_DECAY")
+    else
+        ema_args=(--no-use_ema --ema_decay "$EMA_DECAY")
+    fi
 
     local slot=$((exp_idx % ${#GPU_PAIR_LIST[@]}))
     local gpu_pair="${GPU_PAIR_LIST[$slot]}"
@@ -377,6 +387,7 @@ run_one() {
             "${pretrained_args[@]}" \
             "${resume_args[@]}" \
             "${deep_supervision_args[@]}" \
+            "${ema_args[@]}" \
             --deep_supervision_weights "$DEEP_SUPERVISION_WEIGHTS" \
             --checkpoint_dir "$checkpoint_dir" \
             --experiment_name "$effective_name" \

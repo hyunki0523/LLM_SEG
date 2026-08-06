@@ -1,4 +1,4 @@
-import os, json, argparse, sys, site
+import os, json, argparse, sys, site, copy
 
 # [BUGFIX] bitsandbytes CUDA 12/13 library (libnvJitLink.so) 오류 방지용 동적 경로 주입
 try:
@@ -22,7 +22,6 @@ from accelerate.utils import gather_object
 from accelerate.utils import DistributedDataParallelKwargs
 from accelerate import InitProcessGroupKwargs, DataLoaderConfiguration
 from datetime import timedelta
-from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 
 from data.dataset import get_data_loaders
 from model_custom.stunet import get_stunet_base
@@ -64,6 +63,51 @@ def trainable_state_dict(model, include_buffers=True):
     keep_names = trainable_param_names | buffer_names
     full = model.state_dict()
     return {k: v for k, v in full.items() if k in keep_names}
+
+
+class SegmentationEMA(nn.Module):
+    """EMA copy that shares the frozen LLM instead of averaging 7B weights."""
+
+    llm_prefixes = ("text_encoder.",)
+
+    def __init__(self, model, decay):
+        super().__init__()
+        self.decay = float(decay)
+        # The complete text encoder is frozen in this training recipe. Reuse
+        # that object while deep-copying the trainable segmentation/fusion
+        # network to avoid a second Llama allocation on every GPU.
+        memo = {}
+        text_encoder = getattr(model, "text_encoder", None)
+        if text_encoder is not None:
+            memo[id(text_encoder)] = text_encoder
+        self.module = copy.deepcopy(model, memo)
+        first_parameter = next(model.parameters(), None)
+        device = first_parameter.device if first_parameter is not None else None
+        self.register_buffer(
+            "n_averaged", torch.zeros((), dtype=torch.long, device=device)
+        )
+
+    @torch.no_grad()
+    def update_parameters(self, model):
+        source_parameters = dict(model.named_parameters())
+        first_update = int(self.n_averaged.item()) == 0
+        for name, averaged in self.module.named_parameters():
+            if name.startswith(self.llm_prefixes):
+                continue
+            source = source_parameters[name].detach()
+            if first_update:
+                averaged.copy_(source)
+            else:
+                averaged.mul_(self.decay).add_(source, alpha=1.0 - self.decay)
+
+        # Running statistics and other non-LLM buffers should follow the
+        # online model exactly; integer buffers cannot be exponentially mixed.
+        source_buffers = dict(model.named_buffers())
+        for name, averaged in self.module.named_buffers():
+            if name.startswith(self.llm_prefixes) or name not in source_buffers:
+                continue
+            averaged.copy_(source_buffers[name])
+        self.n_averaged.add_(1)
 
 
 def rater_type(x):
@@ -403,6 +447,8 @@ def make_context_tokens_batch(tokenizer, max_length, context_length, contexts, d
 
 def main(args):
     seed_everything()
+    if not 0.0 <= args.ema_decay < 1.0:
+        raise ValueError("--ema_decay must satisfy 0 <= decay < 1.")
     if args.text_fusion_warmup_epochs < 0:
         raise ValueError("--text_fusion_warmup_epochs must be non-negative.")
     if args.text_fusion_transition_epochs < 0:
@@ -481,6 +527,7 @@ def main(args):
         "cls_loss_weight": args.cls_loss_weight,
         "cls_pos_weight": args.cls_pos_weight,
         "use_ema": args.use_ema,
+        "ema_decay": args.ema_decay,
         "experiment_name": args.experiment_name,
         "include_cc": getattr(args, 'include_cc', True),
         "include_chief_complaint": getattr(args, 'include_chief_complaint', True),
@@ -796,16 +843,26 @@ def main(args):
     )
 
     # === [RESUME] Full state restoration (must be after accelerator.prepare) ===
+    resume_ckpt = None
     if args.resume is not None and os.path.exists(args.resume):
         accelerator.print(f'[RESUME] Loading full checkpoint from: {args.resume}')
         resume_ckpt = torch.load(args.resume, map_location='cpu', weights_only=False)
 
-        # --- Model weights ---
-        if 'model' in resume_ckpt:
-            raw_sd = resume_ckpt['model']
+        # `model` is the inference state (EMA when enabled). New EMA
+        # checkpoints also retain the online state that matches the optimizer.
+        model_state_key = (
+            'online_model'
+            if 'online_model' in resume_ckpt
+            else 'model'
+        )
+        if model_state_key in resume_ckpt:
+            raw_sd = resume_ckpt[model_state_key]
             cleaned_sd = {k[7:] if k.startswith('module.') else k: v for k, v in raw_sd.items()}
             missing, unexpected = accelerator.unwrap_model(model).load_state_dict(cleaned_sd, strict=False)
-            accelerator.print(f'[RESUME] Model weights loaded. Missing: {len(missing)}, Unexpected: {len(unexpected)}')
+            accelerator.print(
+                f'[RESUME] {model_state_key} weights loaded. '
+                f'Missing: {len(missing)}, Unexpected: {len(unexpected)}'
+            )
 
         # --- Optimizer state ---
         optimizer_restored = False
@@ -839,8 +896,27 @@ def main(args):
 
     ema_model = None
     if args.use_ema:
-        ema_avg_fn = get_ema_multi_avg_fn(args.ema_decay)
-        ema_model = AveragedModel(model, multi_avg_fn=ema_avg_fn)
+        # Keep EMA outside DDP. Synchronized online parameters make each
+        # rank's local EMA identical without another distributed wrapper.
+        online_model = accelerator.unwrap_model(model)
+        ema_model = SegmentationEMA(online_model, decay=args.ema_decay)
+        if resume_ckpt is not None and 'online_model' in resume_ckpt and 'model' in resume_ckpt:
+            ema_sd = {
+                k[7:] if k.startswith('module.') else k: v
+                for k, v in resume_ckpt['model'].items()
+            }
+            missing, unexpected = ema_model.module.load_state_dict(ema_sd, strict=False)
+            ema_model.n_averaged.fill_(int(resume_ckpt.get('ema_n_averaged', 0)))
+            accelerator.print(
+                '[RESUME] EMA inference weights restored. '
+                f'Missing: {len(missing)}, Unexpected: {len(unexpected)}, '
+                f'n_averaged={int(ema_model.n_averaged.item())}'
+            )
+        elif resume_ckpt is not None:
+            accelerator.print(
+                '[RESUME] Legacy checkpoint has no separate online/EMA states; '
+                'EMA starts from the restored model weights.'
+            )
         accelerator.print(f"[CHECK] EMA Model initialized with decay: {args.ema_decay}")
 
     train_iter, valid_iter = cycle(train_dl), cycle(valid_dl)
@@ -1189,7 +1265,7 @@ def main(args):
                 epoch_train_loss.append(avg_acc_loss)
 
                 if ema_model is not None:
-                    ema_model.update_parameters(model)
+                    ema_model.update_parameters(accelerator.unwrap_model(model))
 
                 # 실제 Weight Update가 일어날 때만 WandB에 seg_loss와 lr을 로깅합니다.
                 # (진동 없는 깨끗한 그래프를 보실 수 있습니다)
@@ -1516,6 +1592,11 @@ def main(args):
                 'epoch': epoch,
                 'dicom_schema': dicom_schema,
             }
+            if ema_model is not None:
+                checkpoint['online_model'] = trainable_state_dict(
+                    accelerator.unwrap_model(model), include_buffers=True
+                )
+                checkpoint['ema_n_averaged'] = int(ema_model.n_averaged.item())
             accelerator.save(checkpoint, os.path.join(args.checkpoint_dir, f'model_epoch_{epoch}.pth'))
             accelerator.print(f"Saved checkpoint for epoch {epoch} (val_dice: {val_dice_for_this_epoch:.4f}) [with optimizer & scheduler state]")
 
