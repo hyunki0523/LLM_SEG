@@ -806,11 +806,10 @@ class STUNet(nn.Module):
             emb_txt = None
             full_attn_mask = None
             if not force_drop_text and precomputed_text_features is not None:
-                if not self.use_cached_text_features:
-                    raise ValueError(
-                        "Precomputed text requires "
-                        "use_cached_text_features=True."
-                    )
+                # The LLM output is independent of image patches. In online
+                # inference it can be encoded once per case and reused across
+                # every sliding-window forward, even when the model still owns
+                # its frozen text encoder (for example, learned soft prompts).
                 emb_txt = precomputed_text_features.to(x.device)
                 if precomputed_text_mask is not None:
                     full_attn_mask = precomputed_text_mask.to(x.device)

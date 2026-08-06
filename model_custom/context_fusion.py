@@ -241,7 +241,12 @@ class GroundedResidualFusion3D(nn.Module):
         confidence = torch.sigmoid(
             self.compatibility(torch.cat([pooled_vision, pooled_concept], dim=-1))
         )
-        if pooled_concept.shape[0] > 1:
+        # Shuffled compatibility is a training-only auxiliary signal. Running
+        # a distributed all_gather during inference is both unnecessary and
+        # unsafe because ranks may process different sliding-window counts.
+        if not self.training:
+            shuffled_concept = torch.zeros_like(pooled_concept)
+        elif pooled_concept.shape[0] > 1:
             shuffled_concept = pooled_concept.roll(shifts=1, dims=0)
         elif dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1:
             gathered = [torch.zeros_like(pooled_concept) for _ in range(dist.get_world_size())]

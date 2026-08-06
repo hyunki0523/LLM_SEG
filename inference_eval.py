@@ -698,6 +698,31 @@ def main(args):
                     ctx_ids, attn_mask = make_context_tokens(
                         model, ctx_txt, device
                     )
+                    base_model = getattr(model, "module", model)
+                    precompute_dtype = (
+                        torch.bfloat16
+                        if str(args.mixed_precision).lower() == 'bf16'
+                        else torch.float16
+                    )
+                    with torch.no_grad(), torch.autocast(
+                        device_type="cuda",
+                        dtype=precompute_dtype,
+                        enabled=torch.cuda.is_available(),
+                    ):
+                        cached_text_features, cached_text_mask = (
+                            base_model.text_encoder(
+                                ctx_ids,
+                                base_model.contexts,
+                                attn_mask=attn_mask,
+                                position_ids_from_mask=(
+                                    soft_prompt_mode == "disabled"
+                                ),
+                            )
+                        )
+                    # Prevent the full LLM from running again inside every
+                    # sliding-window patch. The encoded states are expanded
+                    # to each patch batch below.
+                    ctx_ids, attn_mask = None, None
 
             dicom_numeric, dicom_categorical = None, None
             if args.use_dicom:
