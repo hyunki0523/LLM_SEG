@@ -7,8 +7,9 @@ set -euo pipefail
 #   slot2 -> GPU 4,5
 #   slot3 -> GPU 6,7
 #
-# DICOM metadata uses FiLM only. LLM text is restricted to extracted_cc and
-# chief_complaint. Reports, refined EMR, labels, demographics and CFG are disabled.
+# LLM text is restricted to extracted_cc, chief_complaint, and an optional
+# allow-list of DICOM acquisition fields. FiLM remains a separate path. Reports,
+# refined EMR, labels, demographics and CFG are disabled.
 
 PROJECT_DIR="${PROJECT_DIR:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk}"
 PYTHON_EXE="${PYTHON_EXE:-python}"
@@ -49,6 +50,7 @@ CONTEXT_MIN_ALPHA="${CONTEXT_MIN_ALPHA:-0.05}"
 RAW_FUSED_SEG_WEIGHT="${RAW_FUSED_SEG_WEIGHT:-0.5}"
 SOFT_PROMPT_MODE="${SOFT_PROMPT_MODE:-learned}"
 TEXT_FEATURE_CACHE="${TEXT_FEATURE_CACHE:-}"
+DICOM_PROMPT_MODE="${DICOM_PROMPT_MODE:-none}"
 EXPERIMENT_NAME_SUFFIX="${EXPERIMENT_NAME_SUFFIX:-}"
 STREAM_LOGS="${STREAM_LOGS:-0}"
 DEEP_SUPERVISION="${DEEP_SUPERVISION:-0}"
@@ -189,6 +191,7 @@ if [ "$CHECK_DATASET_CONTRACT" = "1" ]; then
     $PYTHON_EXE audit_dataset_contract.py \
         --train-csv "$TRAIN_CSV" \
         --valid-csv "$VALID_CSV" \
+        --dicom-prompt-mode "$DICOM_PROMPT_MODE" \
         --output "$LOG_ROOT/dataset_contract_report.json"
 fi
 
@@ -214,6 +217,7 @@ echo "[INFO] RAW_FUSED_SEG_WEIGHT=$RAW_FUSED_SEG_WEIGHT"
 echo "[INFO] USE_EMA=$USE_EMA"
 echo "[INFO] EMA_DECAY=$EMA_DECAY"
 echo "[INFO] SOFT_PROMPT_MODE=$SOFT_PROMPT_MODE"
+echo "[INFO] DICOM_PROMPT_MODE=$DICOM_PROMPT_MODE"
 echo "[INFO] TEXT_FEATURE_CACHE=${TEXT_FEATURE_CACHE:-<online>}"
 echo "[INFO] EXPERIMENT_NAME_SUFFIX=${EXPERIMENT_NAME_SUFFIX:-<none>}"
 echo "[INFO] DEEP_SUPERVISION=$DEEP_SUPERVISION"
@@ -362,6 +366,7 @@ run_one() {
         echo "DICOM FiLM        : $use_dicom"
         echo "Safe text         : $use_context"
         echo "Soft prompt       : $SOFT_PROMPT_MODE"
+        echo "DICOM text mode   : $DICOM_PROMPT_MODE"
         echo "Text cache        : ${TEXT_FEATURE_CACHE:-<online>}"
         echo "Freeze vision     : $freeze_vision"
         echo "Checkpoint        : $checkpoint_dir"
@@ -411,7 +416,7 @@ run_one() {
             --include_chief_complaint "$use_context" \
             --include_emr False \
             --include_demographics False \
-            --dicom_prompt_mode none \
+            --dicom_prompt_mode "$DICOM_PROMPT_MODE" \
             --cfg_scale "$CFG_SCALE"
 
         echo "[DONE] Train: $effective_name"

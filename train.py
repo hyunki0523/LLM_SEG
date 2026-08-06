@@ -635,6 +635,17 @@ def main(args):
             raise ValueError(
                 "The selected cache was not generated in disabled-soft-prompt mode."
             )
+        cache_dicom_prompt_mode = str(
+            text_feature_cache.metadata.get("dicom_prompt_mode", "none")
+        ).strip().lower()
+        requested_dicom_prompt_mode = str(
+            getattr(args, "dicom_prompt_mode", "none") or "none"
+        ).strip().lower()
+        if cache_dicom_prompt_mode != requested_dicom_prompt_mode:
+            raise ValueError(
+                "Text cache DICOM prompt mode does not match this run: "
+                f"cache={cache_dicom_prompt_mode}, requested={requested_dicom_prompt_mode}."
+            )
         if int(text_feature_cache.metadata.get("max_length", -1)) != 128:
             raise ValueError(
                 "Text cache max_length must match the model max_length=128."
@@ -648,7 +659,9 @@ def main(args):
             "chief_complaint",
         ]:
             raise ValueError(
-                "Text cache must contain extracted_cc and chief_complaint only."
+                "Text cache clinical columns must be extracted_cc and "
+                "chief_complaint; optional DICOM text fields are validated "
+                "through dicom_prompt_mode."
             )
         accelerator.print(
             f"[TEXT CACHE] entries={len(text_feature_cache)} "

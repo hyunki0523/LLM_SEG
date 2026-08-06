@@ -10,6 +10,7 @@ import torch
 from transformers import AutoModel, AutoTokenizer
 
 from data.dataset import (
+    DICOM_PROMPT_FIELD_MODES,
     _case_id_column,
     build_safe_clinical_prompt,
     read_dataset_table,
@@ -18,7 +19,9 @@ from model_custom.text_encoder import TextContextEncoder
 from model_custom.text_feature_cache import TextFeatureCache
 
 
-def collect_prompts(csv_paths: list[str]) -> list[str]:
+def collect_prompts(
+    csv_paths: list[str], dicom_prompt_mode: str = "none"
+) -> list[str]:
     prompts: set[str] = set()
     for csv_path in csv_paths:
         frame = read_dataset_table(csv_path)
@@ -30,7 +33,9 @@ def collect_prompts(csv_paths: list[str]) -> list[str]:
         ).reset_index(drop=True)
         prompts.update(
             build_safe_clinical_prompt(
-                frame, ("extracted_cc", "chief_complaint")
+                frame,
+                ("extracted_cc", "chief_complaint"),
+                dicom_prompt_mode=dicom_prompt_mode,
             ).values()
         )
     return sorted(prompts)
@@ -119,6 +124,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-length", type=int, default=128)
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--commit-every", type=int, default=32)
+    parser.add_argument(
+        "--dicom-prompt-mode",
+        default="none",
+        choices=sorted(DICOM_PROMPT_FIELD_MODES),
+        help="Allow-listed DICOM fields serialized into each safe prompt.",
+    )
     return parser.parse_args()
 
 
@@ -127,8 +138,11 @@ def main() -> None:
     if args.batch_size < 1:
         raise ValueError("--batch-size must be positive.")
     device = torch.device(args.device)
-    prompts = collect_prompts(args.csv)
-    print(f"[CACHE] unique safe prompts: {len(prompts)}")
+    prompts = collect_prompts(args.csv, args.dicom_prompt_mode)
+    print(
+        f"[CACHE] unique safe prompts: {len(prompts)} "
+        f"dicom_prompt_mode={args.dicom_prompt_mode}"
+    )
 
     tokenizer, encoder, hidden_dim = load_frozen_text_encoder(
         args.llm_repo, device
@@ -141,21 +155,31 @@ def main() -> None:
         "soft_prompt_mode": "disabled",
         "position_ids": "attention_mask_cumsum",
         "text_columns": ["extracted_cc", "chief_complaint"],
+        "dicom_prompt_mode": args.dicom_prompt_mode,
+        "dicom_prompt_fields": sorted(
+            DICOM_PROMPT_FIELD_MODES[args.dicom_prompt_mode]
+        ),
         "tokenizer_length": len(tokenizer),
     }
 
     cache = TextFeatureCache(args.output, read_only=False)
     if cache.metadata:
+        legacy_defaults = {
+            "dicom_prompt_mode": "none",
+            "dicom_prompt_fields": [],
+        }
         mismatches = {
-            key: (cache.metadata.get(key), value)
+            key: (cache.metadata.get(key, legacy_defaults.get(key)), value)
             for key, value in expected_metadata.items()
-            if cache.metadata.get(key) != value
+            if cache.metadata.get(key, legacy_defaults.get(key)) != value
         }
         if mismatches:
             raise ValueError(
                 "Existing cache metadata does not match this run:\n"
                 + json.dumps(mismatches, indent=2, ensure_ascii=False)
             )
+        if any(key not in cache.metadata for key in legacy_defaults):
+            cache.set_metadata(expected_metadata)
     else:
         cache.set_metadata(expected_metadata)
 

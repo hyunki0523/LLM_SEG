@@ -79,11 +79,12 @@ def _clean_text(value) -> str:
 def build_safe_clinical_prompt(
     df: pd.DataFrame,
     text_columns: Sequence[str] = SAFE_TEXT_COLUMNS,
+    dicom_prompt_mode: str = "none",
 ) -> Dict[str, str]:
-    """Build prompts from the explicitly allowed clinical columns only.
+    """Build prompts from explicitly allowed clinical and DICOM columns.
 
-    DICOM, demographics, reports, labels and refined EMR are intentionally
-    excluded here. DICOM metadata has a separate numeric/categorical FiLM path.
+    Demographics, reports, labels and refined EMR are always excluded. DICOM
+    serialization is opt-in so text-DICOM and FiLM-DICOM remain separable.
     """
     forbidden = {
         "검사결과본문",
@@ -102,6 +103,7 @@ def build_safe_clinical_prompt(
             f"Allowed columns are: {SAFE_TEXT_COLUMNS}"
         )
 
+    dicom_fields = _dicom_fields_for_mode(dicom_prompt_mode)
     id_col = _case_id_column(df)
     prompts: Dict[str, str] = {}
     for _, row in df.iterrows():
@@ -113,6 +115,9 @@ def build_safe_clinical_prompt(
             if value:
                 label = "Extracted CC" if column == "extracted_cc" else "Chief complaint"
                 parts.append(f"{label}: {value}")
+        dicom_parts = _safe_dicom_prompt_parts(row, dicom_fields)
+        if dicom_parts:
+            parts.append("DICOM: " + ", ".join(dicom_parts))
         case_id = str(row[id_col]).strip()
         prompts[case_id] = ("; ".join(parts) + " <SEG>").strip() if parts else "<SEG>"
     return prompts
@@ -274,6 +279,29 @@ def _dicom_fields_for_mode(mode):
         valid = ", ".join(sorted(DICOM_PROMPT_FIELD_MODES))
         raise ValueError(f"Unknown dicom_prompt_mode='{mode}'. Valid modes: {valid}")
     return DICOM_PROMPT_FIELD_MODES[mode]
+
+
+def _safe_dicom_prompt_parts(row, dicom_fields):
+    """Serialize only the allow-listed acquisition fields for LLM input."""
+    field_specs = (
+        ("manufacturer", "Manufacturer", "Manufacturer"),
+        ("kernel", ("ConvolutionKernel", "ReconstructionKernel"), "kernel"),
+        ("slice_thickness", "SliceThickness", "thickness_mm"),
+        ("kvp", "KVP", "KVP"),
+        ("tube_current", "XRayTubeCurrent", "XRayTubeCurrent"),
+        ("pixel_spacing", "PixelSpacing", "PixelSpacing"),
+        ("spacing_between_slices", "SpacingBetweenSlices", "SpacingBetweenSlices"),
+        ("series_description", "SeriesDescription", "SeriesDescription"),
+        ("contrast", ("Contrast", "ContrastBolusAgent"), "Contrast"),
+    )
+    parts = []
+    for field, columns, label in field_specs:
+        if field not in dicom_fields:
+            continue
+        value = _clean_row_value(row, columns)
+        if value:
+            parts.append(f"{label}={value}")
+    return parts
 
 
 def read_dicom_volume(dicom_dir: Path, series_uid: Optional[str] = None) -> Tuple[np.ndarray, sitk.Image]:
@@ -813,10 +841,17 @@ class HemoDataset(Dataset):
         if include_chief_complaint:
             requested_text_columns.append("chief_complaint")
         self.safe_text_columns = tuple(requested_text_columns)
-        self.prompt_map = build_safe_clinical_prompt(self.df, requested_text_columns)
+        self.dicom_prompt_mode = str(dicom_prompt_mode or "none").strip().lower()
+        self.prompt_map = build_safe_clinical_prompt(
+            self.df,
+            requested_text_columns,
+            dicom_prompt_mode=self.dicom_prompt_mode,
+        )
         print(
             "[DATA CONTRACT] text columns: "
-            f"{requested_text_columns or 'none'}; DICOM is excluded from text prompts."
+            f"{requested_text_columns or 'none'}; "
+            f"DICOM text mode: {self.dicom_prompt_mode}; "
+            f"DICOM text fields: {sorted(_dicom_fields_for_mode(self.dicom_prompt_mode)) or 'none'}."
         )
 
         # === 변수명 변경: clinical/findings -> body/conclusion ===

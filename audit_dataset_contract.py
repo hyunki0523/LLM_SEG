@@ -14,6 +14,24 @@ import pandas as pd
 CASE_ID_COLUMN = "영상일련번호ID"
 SAFE_TEXT_COLUMNS = ("extracted_cc", "chief_complaint")
 DICOM_CATEGORICAL_COLUMNS = ("Manufacturer", "ConvolutionKernel")
+DICOM_PROMPT_FIELD_MODES = {
+    "full": {
+        "manufacturer", "kernel", "slice_thickness", "kvp",
+        "tube_current", "pixel_spacing",
+    },
+    "extended": {
+        "manufacturer", "kernel", "slice_thickness", "kvp",
+        "tube_current", "pixel_spacing", "spacing_between_slices",
+        "series_description", "contrast",
+    },
+    "limited": {"kernel", "slice_thickness", "pixel_spacing"},
+    "geometry": {"slice_thickness", "pixel_spacing", "spacing_between_slices"},
+    "kernel_only": {"kernel"},
+    "spacing_only": {"slice_thickness", "pixel_spacing", "spacing_between_slices"},
+    "scanner_only": {"manufacturer", "kvp", "tube_current"},
+    "protocol_only": {"kernel", "series_description", "contrast", "kvp"},
+    "none": set(),
+}
 
 
 REQUIRED_DICOM_COLUMNS = (
@@ -120,6 +138,11 @@ def main() -> int:
     parser.add_argument("--valid-csv", required=True)
     parser.add_argument("--output", default=None)
     parser.add_argument(
+        "--dicom-prompt-mode",
+        default="none",
+        choices=sorted(DICOM_PROMPT_FIELD_MODES),
+    )
+    parser.add_argument(
         "--strict",
         action="store_true",
         help="Exit non-zero when duplicates or train/valid overlap are found.",
@@ -146,7 +169,15 @@ def main() -> int:
         "contract": {
             "allowed_text_columns": list(SAFE_TEXT_COLUMNS),
             "prohibited_text_columns": list(PROHIBITED_TEXT_COLUMNS),
-            "dicom_transport": "numeric/categorical FiLM only; never serialized into LLM text",
+            "dicom_prompt_mode": args.dicom_prompt_mode,
+            "dicom_text_fields": sorted(
+                DICOM_PROMPT_FIELD_MODES[args.dicom_prompt_mode]
+            ),
+            "dicom_transport": (
+                "LLM text serialization from an explicit allow-list"
+                if args.dicom_prompt_mode != "none"
+                else "not serialized into LLM text; optional FiLM path remains separate"
+            ),
         },
         "train": summarize(train, "train"),
         "valid": summarize(valid, "valid"),

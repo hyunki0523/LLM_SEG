@@ -6,6 +6,7 @@ import random
 
 import torch
 
+from data.dataset import DICOM_PROMPT_FIELD_MODES
 from model_custom.text_feature_cache import TextFeatureCache
 from precompute_text_features import (
     collect_prompts,
@@ -27,6 +28,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--atol", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--dicom-prompt-mode",
+        default="none",
+        choices=sorted(DICOM_PROMPT_FIELD_MODES),
+    )
+    parser.add_argument(
         "--coverage-only",
         action="store_true",
         help="Check that every dataset prompt exists without loading the LLM.",
@@ -37,7 +43,13 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     cache = TextFeatureCache(args.cache, read_only=True)
-    prompts = collect_prompts(args.csv)
+    cache_mode = str(cache.metadata.get("dicom_prompt_mode", "none")).lower()
+    if cache_mode != args.dicom_prompt_mode:
+        raise ValueError(
+            "Cache DICOM prompt mode mismatch: "
+            f"cache={cache_mode}, requested={args.dicom_prompt_mode}."
+        )
+    prompts = collect_prompts(args.csv, args.dicom_prompt_mode)
     missing = [prompt for prompt in prompts if not cache.contains(prompt)]
     print(
         f"[COVERAGE] required={len(prompts)} cache_entries={len(cache)} "
