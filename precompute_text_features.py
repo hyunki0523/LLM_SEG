@@ -19,6 +19,39 @@ from model_custom.text_encoder import TextContextEncoder
 from model_custom.text_feature_cache import TextFeatureCache, text_cache_key
 
 
+def _embedding_mean(weight: torch.Tensor, rows: int) -> torch.Tensor:
+    """Compute a stable FP32 mean without materializing the full matrix in FP32."""
+    total = torch.zeros(weight.shape[1], dtype=torch.float32, device=weight.device)
+    for start in range(0, rows, 1024):
+        total += weight[start : min(start + 1024, rows)].float().sum(dim=0)
+    return (total / float(rows)).to(weight.dtype)
+
+
+def deterministically_resize_token_embeddings(model, tokenizer) -> str:
+    """Add tokenizer rows using the exact old-vocabulary mean on every worker."""
+    input_embeddings = model.get_input_embeddings()
+    old_rows = int(input_embeddings.weight.shape[0])
+    new_rows = int(len(tokenizer))
+    if new_rows == old_rows:
+        return "checkpoint_existing"
+    if new_rows < old_rows:
+        raise ValueError(
+            f"Tokenizer vocabulary ({new_rows}) is smaller than model embeddings ({old_rows})."
+        )
+    input_mean = _embedding_mean(input_embeddings.weight.detach(), old_rows)
+    output_embeddings = model.get_output_embeddings()
+    output_mean = None
+    if output_embeddings is not None and output_embeddings is not input_embeddings:
+        output_mean = _embedding_mean(output_embeddings.weight.detach(), old_rows)
+    model.resize_token_embeddings(new_rows, mean_resizing=False)
+    with torch.no_grad():
+        model.get_input_embeddings().weight[old_rows:new_rows].copy_(input_mean)
+        resized_output = model.get_output_embeddings()
+        if output_mean is not None and resized_output is not None:
+            resized_output.weight[old_rows:new_rows].copy_(output_mean)
+    return "mean_existing_embeddings"
+
+
 def collect_prompts(
     csv_paths: list[str], dicom_prompt_mode: str = "none"
 ) -> list[str]:
@@ -67,7 +100,9 @@ def load_frozen_text_encoder(
         low_cpu_mem_usage=True,
         attn_implementation="eager",
     )
-    model.resize_token_embeddings(len(tokenizer))
+    seg_token_initialization = deterministically_resize_token_embeddings(
+        model, tokenizer
+    )
     model.config.use_cache = False
     model.eval().requires_grad_(False)
     model.to(device)
@@ -79,6 +114,18 @@ def load_frozen_text_encoder(
     encoder.pad_id = int(tokenizer.pad_token_id)
     encoder.eval()
     hidden_dim = int(model.config.hidden_size)
+    seg_token_id = int(tokenizer.convert_tokens_to_ids("<SEG>"))
+    seg_embedding = (
+        model.get_input_embeddings().weight[seg_token_id]
+        .detach()
+        .float()
+        .cpu()
+        .numpy()
+        .tobytes()
+    )
+    encoder.seg_token_initialization = seg_token_initialization
+    encoder.seg_token_id = seg_token_id
+    encoder.seg_embedding_sha256 = hashlib.sha256(seg_embedding).hexdigest()
     return tokenizer, encoder, hidden_dim
 
 
@@ -164,6 +211,11 @@ def main() -> None:
                 "Skip-cache DICOM prompt mode mismatch: "
                 f"cache={existing_mode}, requested={args.dicom_prompt_mode}."
             )
+        if not existing_cache.metadata.get("seg_embedding_sha256"):
+            raise ValueError(
+                "The skip cache predates deterministic <SEG> initialization and "
+                "cannot be mixed with new shards. Use a new target cache path."
+            )
         # A contains() call per prompt becomes tens of thousands of random
         # SQLite reads per worker. That is prohibitively slow when six workers
         # share a cache on NAS. Read the compact key column once instead.
@@ -203,6 +255,9 @@ def main() -> None:
             DICOM_PROMPT_FIELD_MODES[args.dicom_prompt_mode]
         ),
         "tokenizer_length": len(tokenizer),
+        "seg_token_initialization": encoder.seg_token_initialization,
+        "seg_token_id": encoder.seg_token_id,
+        "seg_embedding_sha256": encoder.seg_embedding_sha256,
     }
 
     cache = TextFeatureCache(args.output, read_only=False)

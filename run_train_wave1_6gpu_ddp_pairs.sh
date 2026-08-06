@@ -23,8 +23,8 @@ PARALLEL_CACHE_BUILD="${PARALLEL_CACHE_BUILD:-1}"
 CACHE_GPU_IDS="${CACHE_GPU_IDS:-$GPU_IDS}"
 
 SHARED_CACHE_DIR="${SHARED_CACHE_DIR:-${PROJECT_DIR}/text_feature_cache}"
-CC_CACHE_SHARED="${CC_CACHE_SHARED:-${SHARED_CACHE_DIR}/llama2_safe_cc_nosoft.sqlite3}"
-DICOM_TEXT_CACHE_SHARED="${DICOM_TEXT_CACHE_SHARED:-${SHARED_CACHE_DIR}/llama2_safe_cc_dicom_full_nosoft.sqlite3}"
+CC_CACHE_SHARED="${CC_CACHE_SHARED:-${SHARED_CACHE_DIR}/llama2_safe_cc_nosoft_deterministic.sqlite3}"
+DICOM_TEXT_CACHE_SHARED="${DICOM_TEXT_CACHE_SHARED:-${SHARED_CACHE_DIR}/llama2_safe_cc_dicom_full_nosoft_deterministic.sqlite3}"
 LOCAL_CACHE_DIR="${LOCAL_CACHE_DIR:-/tmp/llmseg_text_cache}"
 COPY_CACHE_TO_LOCAL="${COPY_CACHE_TO_LOCAL:-1}"
 

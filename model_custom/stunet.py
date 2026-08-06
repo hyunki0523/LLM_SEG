@@ -520,10 +520,34 @@ class STUNet(nn.Module):
             if model is None:
                 raise RuntimeError(f"지정된 LLM 백본을 로드할 수 없습니다: {repos_to_try}")
 
-            try:
-                model.resize_token_embeddings(len(self.tokenizer))
-            except Exception:
-                pass
+            old_vocab_size = int(model.get_input_embeddings().weight.shape[0])
+            new_vocab_size = int(len(self.tokenizer))
+            if new_vocab_size < old_vocab_size:
+                raise ValueError(
+                    f"Tokenizer vocabulary ({new_vocab_size}) is smaller than "
+                    f"model embeddings ({old_vocab_size})."
+                )
+            if new_vocab_size > old_vocab_size:
+                input_weight = model.get_input_embeddings().weight.detach()
+                input_mean_fp32 = torch.zeros(
+                    input_weight.shape[1], dtype=torch.float32, device=input_weight.device
+                )
+                for start in range(0, old_vocab_size, 1024):
+                    input_mean_fp32 += input_weight[
+                        start : min(start + 1024, old_vocab_size)
+                    ].float().sum(dim=0)
+                input_mean = (input_mean_fp32 / float(old_vocab_size)).to(
+                    input_weight.dtype
+                )
+                model.resize_token_embeddings(new_vocab_size, mean_resizing=False)
+                with torch.no_grad():
+                    model.get_input_embeddings().weight[
+                        old_vocab_size:new_vocab_size
+                    ].copy_(input_mean)
+                print(
+                    "[INFO] New tokenizer embeddings initialized deterministically "
+                    "from the old-vocabulary mean."
+                )
 
             # ✅ backbone만 사용
             self.text_encoder.llm = True
