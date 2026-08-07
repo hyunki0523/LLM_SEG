@@ -9,6 +9,7 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk}"
 PYTHON_EXE="${PYTHON_EXE:-python}"
 GPU_PAIR="${GPU_PAIR:-0,1}"
+NUM_PROCESSES="${NUM_PROCESSES:-2}"
 TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
 VISION_CHECKPOINT="${VISION_CHECKPOINT:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v3a_4gpu_parallel/vision_only_vision_control_1gpu/model_epoch_300.pth}"
@@ -29,11 +30,27 @@ MAX_SENSITIVITY_DROP="${MAX_SENSITIVITY_DROP:-0.01}"
 SKIP_CLASSIFIER="${SKIP_CLASSIFIER:-0}"
 SKIP_VISION_INFERENCE="${SKIP_VISION_INFERENCE:-0}"
 
-IFS=',' read -r -a gpu_list <<< "$GPU_PAIR"
-if [ "${#gpu_list[@]}" -ne 2 ] || [ "${gpu_list[0]}" = "${gpu_list[1]}" ]; then
-    echo "[ERROR] GPU_PAIR must contain two distinct GPU IDs, e.g. 0,1"
+gpu_tokens="${GPU_PAIR//,/ }"
+read -r -a gpu_list <<< "$gpu_tokens"
+if ! [[ "$NUM_PROCESSES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[ERROR] NUM_PROCESSES must be a positive integer."
     exit 2
 fi
+if [ "${#gpu_list[@]}" -ne "$NUM_PROCESSES" ]; then
+    echo "[ERROR] GPU_PAIR must contain exactly $NUM_PROCESSES GPU IDs."
+    exit 2
+fi
+for gpu in "${gpu_list[@]}"; do
+    if ! [[ "$gpu" =~ ^[0-9]+$ ]]; then
+        echo "[ERROR] Invalid GPU ID: $gpu"
+        exit 2
+    fi
+done
+if [ "$(printf '%s\n' "${gpu_list[@]}" | sort -u | wc -l)" -ne "$NUM_PROCESSES" ]; then
+    echo "[ERROR] GPU_PAIR must contain $NUM_PROCESSES distinct GPU IDs."
+    exit 2
+fi
+CUDA_DEVICE_LIST="$(IFS=,; echo "${gpu_list[*]}")"
 for required in "$TRAIN_CSV" "$VALID_CSV" "$VISION_CHECKPOINT" "$SOURCE_TEXT_CACHE"; do
     if [ ! -f "$required" ]; then
         echo "[ERROR] Required file not found: $required"
@@ -47,7 +64,7 @@ VISION_RESULT="${RESULT_ROOT}/vision_probability"
 SWEEP_RESULT="${RESULT_ROOT}/suppression_sweep"
 mkdir -p "$CLASSIFIER_DIR" "$VISION_RESULT" "$SWEEP_RESULT"
 
-CUDA_VISIBLE_DEVICES="$GPU_PAIR" EXPECTED_GPUS=2 \
+CUDA_VISIBLE_DEVICES="$CUDA_DEVICE_LIST" EXPECTED_GPUS="$NUM_PROCESSES" \
     "$PYTHON_EXE" "${PROJECT_DIR}/verify_runtime_environment.py"
 
 echo "[CACHE] Verifying CC-only cache coverage"
@@ -82,9 +99,9 @@ if [ "$SKIP_VISION_INFERENCE" != "1" ]; then
     export NCCL_P2P_DISABLE="${NCCL_P2P_DISABLE:-1}"
     export NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
     export LLMSEG_FORCE_MATH_SDP="${LLMSEG_FORCE_MATH_SDP:-1}"
-    echo "[INFERENCE] Frozen vision probability extraction on GPUs $GPU_PAIR"
-    CUDA_VISIBLE_DEVICES="$GPU_PAIR" accelerate launch \
-        --num_processes 2 --num_machines 1 --mixed_precision bf16 \
+    echo "[INFERENCE] Frozen vision probability extraction on GPUs $CUDA_DEVICE_LIST"
+    CUDA_VISIBLE_DEVICES="$CUDA_DEVICE_LIST" accelerate launch \
+        --num_processes "$NUM_PROCESSES" --num_machines 1 --mixed_precision bf16 \
         --dynamo_backend no --main_process_port "$BASE_PORT" \
         "${PROJECT_DIR}/inference_eval.py" \
         --model_path "$VISION_CHECKPOINT" \

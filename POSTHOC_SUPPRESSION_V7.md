@@ -59,6 +59,22 @@ USE_EMA=1 \
 bash run_posthoc_suppression_v7_2gpu.sh
 ```
 
+## Six-GPU probability extraction
+
+The six-GPU launcher evaluates the same single frozen checkpoint with six
+inference ranks. It does not create six independently trained models. Classifier
+fitting and the CPU suppression sweep still run once.
+
+```bash
+cd /mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk
+
+GPU_IDS="0 1 2 3 4 5" \
+VISION_CHECKPOINT="/absolute/path/to/frozen/vision_checkpoint.pth" \
+TEXT_FEATURE_CACHE="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk/text_feature_cache/llama2_safe_cc_nosoft_deterministic.sqlite3" \
+USE_EMA=1 \
+bash run_posthoc_suppression_v7_6gpu.sh
+```
+
 Set `USE_EMA=0` when the selected checkpoint already contains ordinary model
 weights rather than an EMA `AveragedModel` state.
 
