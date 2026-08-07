@@ -276,7 +276,19 @@ def main() -> None:
     missing_scores = set(SCORE_COLUMNS.values()) - set(scores.columns)
     if missing_scores:
         raise ValueError(f"Normal score CSV lacks columns: {sorted(missing_scores)}")
-    table = annotation.merge(scores, on="case_id", how="inner", validate="one_to_one")
+    # The classifier CSV also carries a diagnostic gt_mask_path.  Merging the
+    # full frame would rename the authoritative inference columns to *_x/*_y
+    # and make the sweep fail after an otherwise successful full inference.
+    # Only normal-score columns are inputs to suppression.
+    annotation["case_id"] = annotation["case_id"].astype(str).str.strip()
+    scores["case_id"] = scores["case_id"].astype(str).str.strip()
+    score_input_columns = ["case_id", *SCORE_COLUMNS.values()]
+    table = annotation.merge(
+        scores[score_input_columns],
+        on="case_id",
+        how="inner",
+        validate="one_to_one",
+    )
     table = table[
         table["probability_path"].notna()
         & table["gt_mask_path"].notna()
