@@ -55,28 +55,51 @@ cd /mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk
 GPU_PAIR="0,1" \
 VISION_CHECKPOINT="/absolute/path/to/frozen/vision_checkpoint.pth" \
 TEXT_FEATURE_CACHE="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk/text_feature_cache/llama2_safe_cc_nosoft_deterministic.sqlite3" \
-USE_EMA=1 \
+USE_EMA=0 \
 bash run_posthoc_suppression_v7_2gpu.sh
 ```
 
-## Six-GPU probability extraction
+## Six-GPU five-condition experiment
 
-The six-GPU launcher evaluates the same single frozen checkpoint with six
-inference ranks. It does not create six independently trained models. Classifier
-fitting and the CPU suppression sweep still run once.
+The six-GPU launcher runs two frozen base models concurrently:
+
+- GPU 0,1,2: Vision-only
+- GPU 3,4,5: true DICOM-FiLM-only (`context=False`, `use_dicom=True`)
+
+The post-hoc matrix then evaluates exactly these groups:
+
+1. Vision-Only (Baseline)
+2. Vision + DICOM FiLM
+3. V7: DICOM + Empty CC
+4. V7: DICOM + Shuffled CC
+5. V7: DICOM + Real CC (Proposed)
+
+All three V7 conditions use the same frozen DICOM-FiLM probability volumes.
+Only the case-level suppression score changes, so the CC ablation is paired and
+does not confound the image/DICOM base model.
 
 ```bash
 cd /mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk
 
 GPU_IDS="0 1 2 3 4 5" \
 VISION_CHECKPOINT="/absolute/path/to/frozen/vision_checkpoint.pth" \
+DICOM_FILM_CHECKPOINT="/absolute/path/to/true_dicom_film_only_checkpoint.pth" \
 TEXT_FEATURE_CACHE="/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk/text_feature_cache/llama2_safe_cc_nosoft_deterministic.sqlite3" \
-USE_EMA=1 \
+VISION_USE_EMA=0 \
+DICOM_USE_EMA=0 \
 bash run_posthoc_suppression_v7_6gpu.sh
 ```
 
-Set `USE_EMA=0` when the selected checkpoint already contains ordinary model
-weights rather than an EMA `AveragedModel` state.
+The launcher verifies each checkpoint's sibling `args.json`. It rejects a
+context-enabled checkpoint as the DICOM-FiLM baseline. In particular, the old
+Wave1 job named `dicom_film` actually launched `dicom_text_safe` and must not be
+used for condition 2. It also requires the Vision and DICOM-FiLM checkpoints to
+match on dataset paths, epoch/iteration schedule, batch/accumulation, learning
+rate, loss, deep supervision, and EMA settings.
+
+Training checkpoints produced by the current `train.py` save EMA module weights
+under the ordinary `model` state dictionary, so inference should normally use
+`USE_EMA=0` (or `VISION_USE_EMA=0`, `DICOM_USE_EMA=0`).
 
 To reuse completed classifier scores and probability extraction:
 
