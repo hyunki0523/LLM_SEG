@@ -71,6 +71,17 @@ done
 all_devices="$(IFS=,; echo "${gpu_list[*]}")"
 vision_devices="${gpu_list[0]},${gpu_list[1]},${gpu_list[2]}"
 dicom_devices="${gpu_list[3]},${gpu_list[4]},${gpu_list[5]}"
+vision_processes=3
+dicom_processes=3
+# When one frozen base has already been extracted, give all six GPUs to the
+# remaining base instead of leaving half of the machine idle.
+if [ "$SKIP_DICOM_INFERENCE" = "1" ] && [ "$SKIP_VISION_INFERENCE" != "1" ]; then
+    vision_devices="$all_devices"
+    vision_processes=6
+elif [ "$SKIP_VISION_INFERENCE" = "1" ] && [ "$SKIP_DICOM_INFERENCE" != "1" ]; then
+    dicom_devices="$all_devices"
+    dicom_processes=6
+fi
 CUDA_VISIBLE_DEVICES="$all_devices" EXPECTED_GPUS=6 \
     "$PYTHON_EXE" "${PROJECT_DIR}/verify_runtime_environment.py"
 "$PYTHON_EXE" "${PROJECT_DIR}/verify_checkpoint_contract.py" \
@@ -119,12 +130,13 @@ NAMES=()
 launch_inference() {
     local name="$1"
     local devices="$2"
-    local checkpoint="$3"
-    local result_dir="$4"
-    local use_dicom="$5"
-    local use_ema="$6"
-    local port="$7"
-    local skip="$8"
+    local processes="$3"
+    local checkpoint="$4"
+    local result_dir="$5"
+    local use_dicom="$6"
+    local use_ema="$7"
+    local port="$8"
+    local skip="$9"
     if [ "$skip" = "1" ]; then
         echo "[SKIP] $name inference; reusing $result_dir"
         return
@@ -138,11 +150,11 @@ launch_inference() {
         ema_args=(--use_ema --ema_decay "$EMA_DECAY")
     fi
     local log_path="${RESULT_ROOT}/${name}_inference.log"
-    echo "[LAUNCH] $name on GPUs $devices -> $log_path"
+    echo "[LAUNCH] $name with $processes ranks on GPUs $devices -> $log_path"
     (
         set -o pipefail
         CUDA_VISIBLE_DEVICES="$devices" accelerate launch \
-            --num_processes 3 --num_machines 1 --mixed_precision bf16 \
+            --num_processes "$processes" --num_machines 1 --mixed_precision bf16 \
             --dynamo_backend no --main_process_port "$port" \
             "${PROJECT_DIR}/inference_eval.py" \
             --model_path "$checkpoint" \
@@ -167,9 +179,9 @@ launch_inference() {
     NAMES+=("$name")
 }
 
-launch_inference vision_only "$vision_devices" "$VISION_CHECKPOINT" \
+launch_inference vision_only "$vision_devices" "$vision_processes" "$VISION_CHECKPOINT" \
     "$VISION_RESULT" 0 "$VISION_USE_EMA" "$BASE_PORT" "$SKIP_VISION_INFERENCE"
-launch_inference dicom_film_only "$dicom_devices" "$DICOM_FILM_CHECKPOINT" \
+launch_inference dicom_film_only "$dicom_devices" "$dicom_processes" "$DICOM_FILM_CHECKPOINT" \
     "$DICOM_RESULT" 1 "$DICOM_USE_EMA" "$((BASE_PORT + 1))" "$SKIP_DICOM_INFERENCE"
 
 failed=0
