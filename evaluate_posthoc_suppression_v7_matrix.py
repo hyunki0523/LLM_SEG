@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prob-threshold", type=float, default=0.5)
     parser.add_argument("--max-sensitivity-drop", type=float, default=0.01)
+    parser.add_argument(
+        "--fast-screen",
+        action="store_true",
+        help="Skip HD95/components during broad beta screening.",
+    )
     return parser.parse_args()
 
 
@@ -114,7 +119,7 @@ def main() -> None:
             )
         target_points = None
         target_tree = None
-        if target.any():
+        if target.any() and not args.fast_screen:
             surface = target & ~binary_erosion(
                 target,
                 structure=np.ones((3, 3, 3), dtype=bool),
@@ -142,6 +147,7 @@ def main() -> None:
                         spacing_zyx,
                         target_points,
                         target_tree,
+                        compute_expensive=not args.fast_screen,
                     ),
                 }
             )
@@ -172,6 +178,7 @@ def main() -> None:
                                 spacing_zyx,
                                 target_points,
                                 target_tree,
+                                compute_expensive=not args.fast_screen,
                             ),
                         }
                     )
@@ -218,6 +225,7 @@ def main() -> None:
                 "paired_labeled_cases": len(table),
                 "v7_probability_base": "frozen DICOM-FiLM",
                 "safety_reference": ["vision_only", "vision_dicom_film"],
+                "fast_screen": bool(args.fast_screen),
             },
             ensure_ascii=False,
             indent=2,

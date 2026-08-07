@@ -29,6 +29,7 @@ P_PROTECT="${P_PROTECT:-0.85}"
 BETAS="${BETAS:-0.25,0.5,1,2,3}"
 TEXT_THRESHOLDS="${TEXT_THRESHOLDS:-0}"
 MAX_SENSITIVITY_DROP="${MAX_SENSITIVITY_DROP:-0.01}"
+FAST_SCREEN="${FAST_SCREEN:-1}"
 SKIP_CLASSIFIER="${SKIP_CLASSIFIER:-0}"
 SKIP_VISION_INFERENCE="${SKIP_VISION_INFERENCE:-0}"
 SKIP_DICOM_INFERENCE="${SKIP_DICOM_INFERENCE:-0}"
@@ -194,6 +195,10 @@ for required in "$VISION_ANNOTATION" "$DICOM_ANNOTATION"; do
 done
 
 echo "[MATRIX] Vision | DICOM FiLM | DICOM+Empty | DICOM+Shuffled | DICOM+Real"
+screen_args=()
+if [ "$FAST_SCREEN" = "1" ]; then
+    screen_args=(--fast-screen)
+fi
 "$PYTHON_EXE" "${PROJECT_DIR}/evaluate_posthoc_suppression_v7_matrix.py" \
     --vision-annotation-csv "$VISION_ANNOTATION" \
     --dicom-annotation-csv "$DICOM_ANNOTATION" \
@@ -204,6 +209,7 @@ echo "[MATRIX] Vision | DICOM FiLM | DICOM+Empty | DICOM+Shuffled | DICOM+Real"
     --betas "$BETAS" \
     --text-thresholds "$TEXT_THRESHOLDS" \
     --max-sensitivity-drop "$MAX_SENSITIVITY_DROP" \
+    "${screen_args[@]}" \
     2>&1 | tee "${RESULT_ROOT}/five_condition_matrix.log"
 
 echo "[DONE] V7 paired five-condition experiment: $RESULT_ROOT"

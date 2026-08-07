@@ -51,6 +51,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--prob-threshold", type=float, default=0.5)
     parser.add_argument("--max-sensitivity-drop", type=float, default=0.01)
+    parser.add_argument(
+        "--fast-screen",
+        action="store_true",
+        help=(
+            "Skip HD95 and connected-component calculations during the broad "
+            "beta screen. Re-run shortlisted beta values without this flag for "
+            "the final geometry metrics."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -158,6 +167,7 @@ def binary_metrics(
     spacing_zyx: tuple[float, ...],
     target_surface_points: np.ndarray | None = None,
     target_tree: cKDTree | None = None,
+    compute_expensive: bool = True,
 ) -> dict[str, float | int]:
     prediction = prediction.astype(bool, copy=False)
     target = target.astype(bool, copy=False)
@@ -166,11 +176,13 @@ def binary_metrics(
     tp = int(np.logical_and(prediction, target).sum())
     fp = int(np.logical_and(prediction, ~target).sum())
     fn = int(np.logical_and(~prediction, target).sum())
-    labeled, components = label(
-        prediction, structure=np.ones((3, 3, 3), dtype=bool)
-    )
-    sizes = np.bincount(labeled.ravel()) if components else np.asarray([0])
-    largest_component = int(sizes[1:].max()) if components else 0
+    largest_component = np.nan
+    if compute_expensive:
+        labeled, components = label(
+            prediction, structure=np.ones((3, 3, 3), dtype=bool)
+        )
+        sizes = np.bincount(labeled.ravel()) if components else np.asarray([0])
+        largest_component = int(sizes[1:].max()) if components else 0
     positive = gt_voxels > 0
     return {
         "gt_is_positive": int(positive),
@@ -179,7 +191,9 @@ def binary_metrics(
         "tp_voxels": tp,
         "fp_voxels": fp,
         "fn_voxels": fn,
-        "largest_fp_component_voxels": largest_component if not positive else 0,
+        "largest_fp_component_voxels": (
+            largest_component if not positive else (0 if compute_expensive else np.nan)
+        ),
         "dice": float(2 * tp / (pred_voxels + gt_voxels)) if positive else np.nan,
         "sensitivity": float(tp / gt_voxels) if positive else np.nan,
         "hd95_mm": (
@@ -190,7 +204,7 @@ def binary_metrics(
                 target_surface_points=target_surface_points,
                 target_tree=target_tree,
             )
-            if positive
+            if positive and compute_expensive
             else np.nan
         ),
         "normal_no_fp": float(pred_voxels == 0) if not positive else np.nan,
@@ -203,7 +217,14 @@ def summarize(per_case: pd.DataFrame, max_sensitivity_drop: float) -> pd.DataFra
     baseline_normal = baseline[baseline["gt_is_positive"] == 0]
     baseline_sensitivity = float(baseline_positive["sensitivity"].mean())
     baseline_fp_total = int(baseline_normal["fp_voxels"].sum())
-    baseline_largest_total = int(baseline_normal["largest_fp_component_voxels"].sum())
+    has_expensive_metrics = bool(
+        baseline_normal["largest_fp_component_voxels"].notna().any()
+    )
+    baseline_largest_total = (
+        int(baseline_normal["largest_fp_component_voxels"].sum())
+        if has_expensive_metrics
+        else None
+    )
     rows = []
     for configuration, group in per_case.groupby("configuration", sort=False):
         positive = group[group["gt_is_positive"] == 1]
@@ -221,19 +242,29 @@ def summarize(per_case: pd.DataFrame, max_sensitivity_drop: float) -> pd.DataFra
             "mean_sensitivity_positive": sensitivity,
             "sensitivity_delta_vs_vision": sensitivity - baseline_sensitivity,
             "mean_hd95_positive_mm_finite": (
-                float(finite_hd95.mean()) if len(finite_hd95) else float("inf")
+                float(finite_hd95.mean()) if len(finite_hd95) else np.nan
             ),
-            "positive_infinite_hd95_count": int((~np.isfinite(positive["hd95_mm"])).sum()),
+            "positive_infinite_hd95_count": (
+                int((~np.isfinite(positive["hd95_mm"])).sum())
+                if positive["hd95_mm"].notna().any()
+                else np.nan
+            ),
             "mean_fn_delta_vs_vision": np.nan,
             "normal_no_fp_rate": float(normal["normal_no_fp"].mean()),
             "normal_total_fp_voxels": int(normal["fp_voxels"].sum()),
             "normal_total_fp_voxel_reduction": baseline_fp_total - int(normal["fp_voxels"].sum()),
-            "normal_mean_largest_fp_component_voxels": float(
-                normal["largest_fp_component_voxels"].mean()
+            "normal_mean_largest_fp_component_voxels": (
+                float(normal["largest_fp_component_voxels"].mean())
+                if has_expensive_metrics
+                else np.nan
             ),
             "normal_largest_component_voxel_reduction_total": (
-                baseline_largest_total - int(normal["largest_fp_component_voxels"].sum())
+                baseline_largest_total
+                - int(normal["largest_fp_component_voxels"].sum())
+                if has_expensive_metrics
+                else np.nan
             ),
+            "expensive_metrics_computed": has_expensive_metrics,
             "safety_pass": bool(
                 baseline_sensitivity - sensitivity <= max_sensitivity_drop + 1e-12
             ),
@@ -313,7 +344,7 @@ def main() -> None:
             )
         target_surface_points = None
         target_tree = None
-        if target.any():
+        if target.any() and not args.fast_screen:
             target_surface = target & ~binary_erosion(
                 target,
                 structure=np.ones((3, 3, 3), dtype=bool),
@@ -329,6 +360,7 @@ def main() -> None:
             spacing_zyx,
             target_surface_points,
             target_tree,
+            compute_expensive=not args.fast_screen,
         )
         records.append(
             {
@@ -371,6 +403,7 @@ def main() -> None:
                                 spacing_zyx,
                                 target_surface_points,
                                 target_tree,
+                                compute_expensive=not args.fast_screen,
                             ),
                         }
                     )
@@ -394,6 +427,7 @@ def main() -> None:
         "prob_threshold": args.prob_threshold,
         "max_sensitivity_drop": args.max_sensitivity_drop,
         "processed_labeled_cases": len(table),
+        "fast_screen": bool(args.fast_screen),
     }
     (output_dir / "sweep_metadata.json").write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
