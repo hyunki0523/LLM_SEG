@@ -78,6 +78,18 @@ All three V7 conditions use the same frozen DICOM-FiLM probability volumes.
 Only the case-level suppression score changes, so the CC ablation is paired and
 does not confound the image/DICOM base model.
 
+If only the matching Vision Wave0 model has finished, train its true FiLM-only
+counterpart on the same two GPUs before running the matrix:
+
+```bash
+GPU_PAIR="0,1" \
+bash run_train_wave0_dicom_film_ema_2gpu.sh
+```
+
+This launcher mirrors the Vision Wave0 defaults: 120 epochs, batch 2,
+accumulation 8, 128 train iterations, 25 validation iterations, EMA 0.999, and
+DS2 weights `1.0,0.3`. Its only modality change is `use_dicom=True`.
+
 ```bash
 cd /mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk
 
