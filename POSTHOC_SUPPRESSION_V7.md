@@ -135,3 +135,36 @@ bash run_posthoc_suppression_v7_2gpu.sh
 
 No condition is accepted unless positive-cohort sensitivity decreases by no more
 than `0.01` in absolute value relative to the same frozen vision probabilities.
+
+## V7.2 safety correction
+
+V7.1 showed that the positive/normal means of `P(normal)` are insufficient for
+clinical safety.  A positive case may sit in the high-confidence normal tail,
+and a mean sensitivity constraint can hide a small number of severe failures.
+V7.2 therefore requires every candidate to pass all of the following:
+
+- mean sensitivity loss versus Vision-only at most 1 percentage point;
+- 95th-percentile incremental loss versus DICOM-FiLM at most 1 point;
+- rate of cases with more than 5-point incremental loss at most 0.1%; and
+- zero cases changed from DICOM true-positive detection to complete miss.
+
+The audit also reports lesion-size strata, `P(normal)` strata, and the original
+CC for every false-normal positive case.  Parameters are selected on a
+deterministic 70% calibration partition, then evaluated once on the locked 30%
+holdout partition.  This is still internal validation; the OOD test set remains
+untouched until an operating point is locked.
+
+```bash
+cd /mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk
+bash run_wave_v72_safety_calibration.sh
+```
+
+This wave is CPU-only and reuses saved paired probability maps.  The fast sweep
+uses an exact threshold-crossing formulation rather than recreating a 3-D
+probability volume for every beta.
+
+V7.2 does **not** raise `p_protect` solely because the text classifier is highly
+confident.  That rule would apply the strongest suppression to overconfident
+false-normal hemorrhage cases.  High-confidence vision false positives require
+an independent image/anatomy or component-level FP discriminator before the
+0.85 protection boundary can be safely relaxed.

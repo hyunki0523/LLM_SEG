@@ -17,6 +17,7 @@ from evaluate_posthoc_suppression_v7 import (
     load_ground_truth,
     parse_float_list,
     summarize,
+    suppression_strength,
     suppress_probability,
 )
 
@@ -26,6 +27,71 @@ V7_SCORE_COLUMNS = {
     "v7_dicom_shuffled_cc": "p_normal_shuffled_llm",
     "v7_real_cc_proposed": "p_normal_real_llm",
 }
+
+
+def prepare_fast_suppression_counts(
+    probability: np.ndarray,
+    target: np.ndarray,
+    p_min: float,
+    p_protect: float,
+    probability_threshold: float,
+) -> dict[str, object]:
+    """Precompute exact threshold-crossing strengths for a fast broad sweep.
+
+    For a fixed voxel, V7 changes the binary prediction only when
+    beta * text_strength exceeds (vision_logit - threshold_logit) / weight.
+    Sorting those critical strengths once avoids rebuilding a full 3-D float
+    probability volume for every beta/text-threshold combination.
+    """
+    clipped = np.clip(probability.astype(np.float32), 1e-6, 1.0 - 1e-6)
+    predicted = clipped >= probability_threshold
+    target = target.astype(bool, copy=False)
+    active = predicted & (clipped >= p_min) & (clipped < p_protect)
+    weight = np.empty(0, dtype=np.float32)
+    critical = np.empty(0, dtype=np.float32)
+    if active.any():
+        active_probability = clipped[active]
+        weight = (p_protect - active_probability) / (p_protect - p_min)
+        threshold_logit = np.log(probability_threshold) - np.log1p(
+            -probability_threshold
+        )
+        active_logit = np.log(active_probability) - np.log1p(-active_probability)
+        critical = ((active_logit - threshold_logit) / weight).astype(np.float32)
+    return {
+        "gt_voxels": int(target.sum()),
+        "base_tp": int(np.logical_and(predicted, target).sum()),
+        "base_fp": int(np.logical_and(predicted, ~target).sum()),
+        "critical_tp": np.sort(critical[target[active]]),
+        "critical_fp": np.sort(critical[~target[active]]),
+    }
+
+
+def fast_suppression_metrics(
+    prepared: dict[str, object], effective_strength: float
+) -> dict[str, object]:
+    critical_tp = prepared["critical_tp"]
+    critical_fp = prepared["critical_fp"]
+    removed_tp = int(np.searchsorted(critical_tp, effective_strength, side="left"))
+    removed_fp = int(np.searchsorted(critical_fp, effective_strength, side="left"))
+    tp = int(prepared["base_tp"]) - removed_tp
+    fp = int(prepared["base_fp"]) - removed_fp
+    gt_voxels = int(prepared["gt_voxels"])
+    fn = gt_voxels - tp
+    pred_voxels = tp + fp
+    dice_denominator = pred_voxels + gt_voxels
+    return {
+        "gt_is_positive": int(gt_voxels > 0),
+        "gt_voxels": gt_voxels,
+        "pred_voxels": pred_voxels,
+        "tp_voxels": tp,
+        "fp_voxels": fp,
+        "fn_voxels": fn,
+        "largest_fp_component_voxels": np.nan,
+        "dice": 2.0 * tp / dice_denominator if dice_denominator else 1.0,
+        "sensitivity": tp / gt_voxels if gt_voxels else np.nan,
+        "hd95_mm": np.nan,
+        "normal_no_fp": float(fp == 0) if not gt_voxels else np.nan,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -152,18 +218,41 @@ def main() -> None:
                 }
             )
 
+        fast_prepared = None
+        if args.fast_screen:
+            fast_prepared = prepare_fast_suppression_counts(
+                dicom_probability,
+                target,
+                args.p_min,
+                args.p_protect,
+                args.prob_threshold,
+            )
         for condition, score_column in V7_SCORE_COLUMNS.items():
             p_normal = float(row[score_column])
             for threshold in args.text_thresholds:
                 for beta in args.betas:
-                    final_probability = suppress_probability(
-                        dicom_probability,
-                        p_normal,
-                        beta,
-                        args.p_min,
-                        args.p_protect,
-                        threshold,
-                    )
+                    if args.fast_screen:
+                        metrics = fast_suppression_metrics(
+                            fast_prepared,
+                            beta * suppression_strength(p_normal, threshold),
+                        )
+                    else:
+                        final_probability = suppress_probability(
+                            dicom_probability,
+                            p_normal,
+                            beta,
+                            args.p_min,
+                            args.p_protect,
+                            threshold,
+                        )
+                        metrics = binary_metrics(
+                            final_probability >= args.prob_threshold,
+                            target,
+                            spacing_zyx,
+                            target_points,
+                            target_tree,
+                            compute_expensive=True,
+                        )
                     records.append(
                         {
                             "case_id": row["case_id"],
@@ -172,14 +261,7 @@ def main() -> None:
                             "beta": beta,
                             "text_threshold": threshold,
                             "p_normal": p_normal,
-                            **binary_metrics(
-                                final_probability >= args.prob_threshold,
-                                target,
-                                spacing_zyx,
-                                target_points,
-                                target_tree,
-                                compute_expensive=not args.fast_screen,
-                            ),
+                            **metrics,
                         }
                     )
         if (index + 1) % 50 == 0 or index + 1 == len(table):
