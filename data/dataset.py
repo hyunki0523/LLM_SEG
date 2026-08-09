@@ -1058,13 +1058,21 @@ class HemoDataset(Dataset):
         image_tensor = torch.from_numpy(
             ((windowing_3ch(img) - 0.5) / 0.5).astype(np.float32, copy=False)
         )
-        return {
+        sample = {
             'data': image_tensor,
             'target': torch.from_numpy((mask > 0).astype(np.uint8, copy=False)),
             'case_id': case_id,
             'image_path': str(img_path),
             'mask_path': str(mask_path),
         }
+        if self.use_dicom:
+            sample['dicom_numeric'] = torch.from_numpy(
+                np.asarray(self.dicom_numeric[idx], dtype=np.float32)
+            )
+            sample['dicom_categorical'] = torch.from_numpy(
+                np.asarray(self.dicom_categorical[idx], dtype=np.int64)
+            )
+        return sample
 
     def __getitem__(self, idx, sample_positive=True, sampling_mode=None):
         row = self.df.loc[idx]

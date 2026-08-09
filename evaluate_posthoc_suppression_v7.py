@@ -269,6 +269,10 @@ def summarize(per_case: pd.DataFrame, max_sensitivity_drop: float) -> pd.DataFra
                 baseline_sensitivity - sensitivity <= max_sensitivity_drop + 1e-12
             ),
         }
+        if "p_min" in group.columns:
+            row["p_min"] = group["p_min"].iloc[0]
+        if "p_protect" in group.columns:
+            row["p_protect"] = group["p_protect"].iloc[0]
         if configuration == "vision_only":
             row["mean_fn_delta_vs_vision"] = 0.0
         else:

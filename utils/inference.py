@@ -1,7 +1,7 @@
 
 from functools import lru_cache
 import itertools
-from typing import Union, Tuple, List, Optional, Any
+from typing import Union, Tuple, List, Optional, Any, Dict
 
 import numpy as np
 import torch
@@ -122,10 +122,40 @@ def _unwrap_model_output(out: Any) -> torch.Tensor:
     raise TypeError(f"Unsupported model output type: {type(out)}")
 
 
-def _forward_model(x: torch.Tensor, model, context=None) -> torch.Tensor:
+def _batch_model_kwargs(
+    model_kwargs: Optional[Dict[str, Any]],
+    batch_size: int,
+    device: torch.device,
+) -> Dict[str, Any]:
+    """Move case-level conditioning to device and repeat it for SW patches."""
+    batched = {}
+    for key, value in (model_kwargs or {}).items():
+        if not torch.is_tensor(value):
+            batched[key] = value
+            continue
+        value = value.to(device, non_blocking=False)
+        if value.ndim == 1:
+            value = value.unsqueeze(0)
+        if value.shape[0] == 1 and batch_size > 1:
+            value = value.expand(batch_size, *value.shape[1:])
+        elif value.shape[0] != batch_size:
+            raise ValueError(
+                f"Model kwarg '{key}' has batch={value.shape[0]}, expected 1 or {batch_size}."
+            )
+        batched[key] = value
+    return batched
+
+
+def _forward_model(
+    x: torch.Tensor,
+    model,
+    context=None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
+) -> torch.Tensor:
+    kwargs = _batch_model_kwargs(model_kwargs, int(x.shape[0]), x.device)
     if context is not None:
-        return _unwrap_model_output(model(x, context))
-    return _unwrap_model_output(model(x))
+        return _unwrap_model_output(model(x, context, **kwargs))
+    return _unwrap_model_output(model(x, **kwargs))
 
 
 def _internal_maybe_mirror_and_predict(
@@ -133,9 +163,12 @@ def _internal_maybe_mirror_and_predict(
     model,
     mirror_axes: Optional[List[int]] = None,
     context=None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
 ) -> torch.Tensor:
     # base prediction
-    prediction = _forward_model(x, model, context=context)
+    prediction = _forward_model(
+        x, model, context=context, model_kwargs=model_kwargs
+    )
 
     if mirror_axes is None:
         return prediction
@@ -152,7 +185,9 @@ def _internal_maybe_mirror_and_predict(
 
     for axes in axes_combinations:
         x_flipped = torch.flip(x, axes)
-        pred_flipped = _forward_model(x_flipped, model, context=context)
+        pred_flipped = _forward_model(
+            x_flipped, model, context=context, model_kwargs=model_kwargs
+        )
         prediction = prediction + torch.flip(pred_flipped, axes)
 
     prediction = prediction / (len(axes_combinations) + 1)
@@ -166,6 +201,7 @@ def _infer_out_channels_from_first_patch(
     device: torch.device,
     mirror_axes: Optional[List[int]] = None,
     context=None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
 ) -> Tuple[int, torch.Tensor]:
     """
     첫 번째 patch로 1회 forward 해서 out_ch를 추정.
@@ -174,7 +210,13 @@ def _infer_out_channels_from_first_patch(
     """
     first_sl = slicers[0]
     workon = data[first_sl][None].to(device, non_blocking=False)  # [1, C_in, ...]
-    pred0 = _internal_maybe_mirror_and_predict(workon, model, mirror_axes=mirror_axes, context=context)
+    pred0 = _internal_maybe_mirror_and_predict(
+        workon,
+        model,
+        mirror_axes=mirror_axes,
+        context=context,
+        model_kwargs=model_kwargs,
+    )
     pred0 = _unwrap_model_output(pred0)
     if pred0.ndim < 3:
         raise RuntimeError(f"Unexpected prediction ndim={pred0.ndim}, shape={tuple(pred0.shape)}")
@@ -195,6 +237,7 @@ def _internal_predict_sliding_window_return_logits(
     use_gaussian: bool = True,
     mirror_axes: Optional[List[int]] = None,
     context=None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
     accumulation_dtype: torch.dtype = torch.float16,
     sw_batch_size: int = 1,
 ):
@@ -215,6 +258,7 @@ def _internal_predict_sliding_window_return_logits(
             device=device,
             mirror_axes=mirror_axes,
             context=context,
+            model_kwargs=model_kwargs,
         )
 
         # 2) allocate buffers
@@ -266,7 +310,11 @@ def _internal_predict_sliding_window_return_logits(
             if non_first_patches:
                 batched_input = torch.cat(non_first_patches, dim=0).to(device, non_blocking=False)  # [B, C_in, ...]
                 batched_pred = _internal_maybe_mirror_and_predict(
-                    batched_input, model, mirror_axes=mirror_axes, context=context
+                    batched_input,
+                    model,
+                    mirror_axes=mirror_axes,
+                    context=context,
+                    model_kwargs=model_kwargs,
                 )
                 batched_pred = _unwrap_model_output(batched_pred)
                 batched_pred = batched_pred.to(results_device, non_blocking=False)
@@ -315,6 +363,7 @@ def predict_sliding_window_return_logits(
     mirror_axes: Optional[List[int]] = None,
     use_gaussian: bool = True,
     context=None,
+    model_kwargs: Optional[Dict[str, Any]] = None,
     pad_value: float = -1.0,              # train과 동일하게 [-1,1] 입력이면 -1이 맞음
     accumulation_dtype: torch.dtype = torch.float16,
     sw_batch_size: int = 1,
@@ -343,6 +392,7 @@ def predict_sliding_window_return_logits(
         mirror_axes=mirror_axes,
         use_gaussian=use_gaussian,
         context=context,
+        model_kwargs=model_kwargs,
         accumulation_dtype=accumulation_dtype,
         sw_batch_size=sw_batch_size,
     )

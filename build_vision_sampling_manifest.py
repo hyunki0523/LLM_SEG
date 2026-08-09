@@ -7,6 +7,7 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import nibabel as nib
@@ -211,18 +212,21 @@ def main() -> None:
     if duplicates:
         raise RuntimeError(f"Manifest contains {duplicates} duplicate case IDs.")
     output.parent.mkdir(parents=True, exist_ok=True)
-    frame.to_csv(output, index=False, encoding="utf-8-sig")
+    temporary_output = output.with_name(f".{output.name}.{os.getpid()}.tmp")
+    frame.to_csv(temporary_output, index=False, encoding="utf-8-sig")
+    os.replace(temporary_output, output)
     summary = (
         frame.groupby(["split", "supervision_status"], dropna=False)
         .size()
         .rename("count")
         .reset_index()
     )
-    summary.to_csv(
-        output.with_name(output.stem + "_summary.csv"),
-        index=False,
-        encoding="utf-8-sig",
+    summary_output = output.with_name(output.stem + "_summary.csv")
+    temporary_summary = summary_output.with_name(
+        f".{summary_output.name}.{os.getpid()}.tmp"
     )
+    summary.to_csv(temporary_summary, index=False, encoding="utf-8-sig")
+    os.replace(temporary_summary, summary_output)
     metadata = {
         "schema_version": 1,
         "train_csv": str(args.train_csv),
@@ -234,12 +238,13 @@ def main() -> None:
         "train_eligible": int(frame["train_eligible"].sum()),
         "validation_eligible": int(frame["validation_eligible"].sum()),
     }
-    with open(
-        output.with_name(output.stem + "_metadata.json"),
-        "w",
-        encoding="utf-8",
-    ) as metadata_file:
+    metadata_output = output.with_name(output.stem + "_metadata.json")
+    temporary_metadata = metadata_output.with_name(
+        f".{metadata_output.name}.{os.getpid()}.tmp"
+    )
+    with open(temporary_metadata, "w", encoding="utf-8") as metadata_file:
         json.dump(metadata, metadata_file, indent=2, ensure_ascii=False)
+    os.replace(temporary_metadata, metadata_output)
     print(summary.to_string(index=False))
     print(f"[DONE] manifest={output}")
 

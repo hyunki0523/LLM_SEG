@@ -50,6 +50,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-csv", required=True)
     parser.add_argument("--text-feature-cache", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--vision-manifest",
+        default=None,
+        help="Optional supervision contract; invalid train rows are excluded from fitting.",
+    )
     parser.add_argument("--mask-dir", action="append", default=None)
     parser.add_argument("--seed", type=int, default=20260806)
     parser.add_argument("--calibration-fraction", type=float, default=0.1)
@@ -179,6 +184,24 @@ def main() -> None:
         for value in train_frame[train_case_column]
         if str(value).strip() in train_targets
     ]
+    if args.vision_manifest:
+        manifest = pd.read_csv(args.vision_manifest, encoding="utf-8-sig")
+        required = {"case_id", "train_eligible"}
+        if required - set(manifest.columns):
+            raise ValueError("Vision manifest lacks case_id/train_eligible.")
+        manifest["case_id"] = manifest["case_id"].astype(str).str.strip()
+        eligible_text = manifest["train_eligible"].astype(str).str.strip().str.lower()
+        if (~eligible_text.isin({"true", "false", "1", "0"})).any():
+            raise ValueError("Vision manifest train_eligible contains invalid booleans.")
+        eligible = manifest.loc[
+            eligible_text.isin({"true", "1"}), "case_id"
+        ]
+        eligible_cases = set(eligible)
+        before = len(train_cases)
+        train_cases = [case_id for case_id in train_cases if case_id in eligible_cases]
+        print(
+            f"[VISION MANIFEST] classifier train cases {before} -> {len(train_cases)}"
+        )
     valid_cases = [str(value).strip() for value in valid_frame[valid_case_column]]
     if len(train_cases) < 20 or len(set(train_targets[c] for c in train_cases)) != 2:
         raise RuntimeError("Insufficient labeled train cases or only one GT class was found.")
@@ -288,6 +311,7 @@ def main() -> None:
         "train_positive": int((1 - train_y).sum()),
         "cache": str(Path(args.text_feature_cache).resolve()),
         "cache_metadata": cache.metadata,
+        "vision_manifest": args.vision_manifest,
         "metrics": {
             "real_llm": classification_metrics(
                 valid_y, real_llm_probability[labeled]

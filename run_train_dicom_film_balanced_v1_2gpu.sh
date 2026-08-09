@@ -1,6 +1,9 @@
 #!/bin/bash
 set -euo pipefail
 
+# Matched DICOM-FiLM counterpart to Vision-Balanced-v1. All optimization,
+# sampling, EMA, DS2 and SW-monitor settings are kept identical.
+
 PROJECT_DIR="${PROJECT_DIR:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk}"
 PYTHON_EXE="${PYTHON_EXE:-python}"
 GPU_PAIR="${GPU_PAIR:-0,1}"
@@ -8,18 +11,21 @@ TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/2606
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
 MANIFEST="${MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v1.csv}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
+SEED="${SEED:-42}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-dicom_film_balanced_v1_seed${SEED}}"
+
 if [ -z "${CHECKPOINT_DIR:-}" ]; then
     if [ "$SMOKE_TEST" = "1" ]; then
-        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v1/smoke"
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/dicom_film_balanced_v1/smoke_seed${SEED}"
     else
-        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v1/vision_only_balanced_v1"
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/dicom_film_balanced_v1/seed${SEED}"
     fi
 fi
 run_kind="full"
 if [ "$SMOKE_TEST" = "1" ]; then
     run_kind="smoke"
 fi
-LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/vision_balanced_v1_2gpu_${run_kind}_$(date +%Y%m%d_%H%M%S)}"
+LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/dicom_film_balanced_v1_2gpu_${run_kind}_seed${SEED}_$(date +%Y%m%d_%H%M%S)}"
 
 PATCH_SIZE="${PATCH_SIZE:-32 224 224}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
@@ -29,8 +35,6 @@ MAX_OPTIMIZER_STEPS="${MAX_OPTIMIZER_STEPS:-5000}"
 WARMUP_OPTIMIZER_STEPS="${WARMUP_OPTIMIZER_STEPS:-250}"
 EPOCHS="${EPOCHS:-313}"
 LR="${LR:-1e-5}"
-SEED="${SEED:-42}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-vision_balanced_v1_seed${SEED}}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 SW_VALID_INTERVAL_STEPS="${SW_VALID_INTERVAL_STEPS:-500}"
 SW_VALID_POSITIVE_CASES="${SW_VALID_POSITIVE_CASES:-128}"
@@ -61,7 +65,7 @@ mkdir -p "$(dirname "$MANIFEST")" "$CHECKPOINT_DIR" "$LOG_ROOT"
 
 if [ ! -f "$MANIFEST" ]; then
     echo "[MANIFEST] Building supervision manifest: $MANIFEST"
-    "$PYTHON_EXE" build_vision_sampling_manifest.py \
+    "$PYTHON_EXE" -u build_vision_sampling_manifest.py \
         --train-csv "$TRAIN_CSV" \
         --valid-csv "$VALID_CSV" \
         --output "$MANIFEST" \
@@ -76,9 +80,8 @@ if [ "$MANIFEST_ONLY" = "1" ]; then
     exit 0
 fi
 
-EXPECTED_GPUS="${EXPECTED_GPUS:-2}"
 if [ -f "${PROJECT_DIR}/verify_runtime_environment.py" ]; then
-    CUDA_VISIBLE_DEVICES="$GPU_PAIR" EXPECTED_GPUS="$EXPECTED_GPUS" \
+    CUDA_VISIBLE_DEVICES="$GPU_PAIR" EXPECTED_GPUS=2 \
         "$PYTHON_EXE" "${PROJECT_DIR}/verify_runtime_environment.py"
 fi
 
@@ -108,19 +111,20 @@ if [ "${#gpu_array[@]}" -ne 2 ]; then
     exit 2
 fi
 
-run_log="${LOG_ROOT}/vision_balanced_v1.log"
-echo "[LAUNCH] Vision-Balanced-v1 on GPUs $GPU_PAIR"
+run_log="${LOG_ROOT}/dicom_film_balanced_v1.log"
+echo "[LAUNCH] DICOM-FiLM-Balanced-v1 seed=$SEED on GPUs $GPU_PAIR"
 echo "[LOG] $run_log"
 
 CUDA_VISIBLE_DEVICES="$GPU_PAIR" \
 accelerate launch \
     --num_processes 2 \
-    --main_process_port "${BASE_PORT:-30600}" \
+    --main_process_port "${BASE_PORT:-30610}" \
     --mixed_precision bf16 \
     --dynamo_backend no \
     train.py \
     --no-context \
-    --no-use_dicom \
+    --use_dicom \
+    --dicom_prompt_mode none \
     --soft_prompt_mode disabled \
     --train_csv "$TRAIN_CSV" \
     --valid_csv "$VALID_CSV" \
@@ -158,4 +162,4 @@ accelerate launch \
     "${resume_args[@]}" \
     2>&1 | tee "$run_log"
 
-echo "[DONE] Vision-Balanced-v1: $CHECKPOINT_DIR"
+echo "[DONE] DICOM-FiLM-Balanced-v1: $CHECKPOINT_DIR"

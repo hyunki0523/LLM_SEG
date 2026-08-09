@@ -12,6 +12,7 @@ PYTHON_EXE="${PYTHON_EXE:-python}"
 GPU_IDS="${GPU_IDS:-}"
 TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
+VISION_MANIFEST="${VISION_MANIFEST:-}"
 VISION_CHECKPOINT="${VISION_CHECKPOINT:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/safe_film_context_v3a_4gpu_parallel/vision_only_vision_control_1gpu/model_epoch_300.pth}"
 DICOM_FILM_CHECKPOINT="${DICOM_FILM_CHECKPOINT:-}"
 LLM_REPO="${LLM_REPO:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_seg_jhk/model_custom/llama2/Llama-2-7b-chat-hf}"
@@ -33,6 +34,7 @@ FAST_SCREEN="${FAST_SCREEN:-1}"
 SKIP_CLASSIFIER="${SKIP_CLASSIFIER:-0}"
 SKIP_VISION_INFERENCE="${SKIP_VISION_INFERENCE:-0}"
 SKIP_DICOM_INFERENCE="${SKIP_DICOM_INFERENCE:-0}"
+SKIP_MATRIX="${SKIP_MATRIX:-0}"
 
 if [ -z "$GPU_IDS" ]; then
     echo "[ERROR] Explicitly set six GPU IDs, e.g. GPU_IDS='0 1 2 3 4 5'"
@@ -108,11 +110,20 @@ echo "[CACHE] Copying cache to local storage: $LOCAL_TEXT_CACHE"
 cp -f "$SOURCE_TEXT_CACHE" "$LOCAL_TEXT_CACHE"
 
 if [ "$SKIP_CLASSIFIER" != "1" ]; then
+    manifest_args=()
+    if [ -n "$VISION_MANIFEST" ]; then
+        if [ ! -f "$VISION_MANIFEST" ]; then
+            echo "[ERROR] Vision manifest not found: $VISION_MANIFEST"
+            exit 2
+        fi
+        manifest_args=(--vision-manifest "$VISION_MANIFEST")
+    fi
     "$PYTHON_EXE" "${PROJECT_DIR}/fit_posthoc_normal_suppressor.py" \
         --train-csv "$TRAIN_CSV" \
         --valid-csv "$VALID_CSV" \
         --text-feature-cache "$LOCAL_TEXT_CACHE" \
         --output-dir "$CLASSIFIER_DIR" \
+        "${manifest_args[@]}" \
         2>&1 | tee "${RESULT_ROOT}/fit_normal_classifier.log"
 fi
 SCORES_CSV="${CLASSIFIER_DIR}/valid_normal_scores.csv"
@@ -207,6 +218,11 @@ for required in "$VISION_ANNOTATION" "$DICOM_ANNOTATION"; do
 done
 
 echo "[MATRIX] Vision | DICOM FiLM | DICOM+Empty | DICOM+Shuffled | DICOM+Real"
+if [ "$SKIP_MATRIX" = "1" ]; then
+    echo "[DONE] Probability extraction/classifier complete; matrix deferred to V7.2."
+    echo "[DONE] Artifacts: $RESULT_ROOT"
+    exit 0
+fi
 screen_args=()
 if [ "$FAST_SCREEN" = "1" ]; then
     screen_args=(--fast-screen)

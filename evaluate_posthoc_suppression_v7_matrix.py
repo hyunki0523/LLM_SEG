@@ -100,8 +100,26 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dicom-annotation-csv", required=True)
     parser.add_argument("--normal-scores-csv", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--split-manifest", default=None)
+    parser.add_argument(
+        "--cohort-part",
+        choices=("all", "calibration", "locked"),
+        default="all",
+    )
     parser.add_argument("--p-min", type=float, default=0.2)
     parser.add_argument("--p-protect", type=float, default=0.85)
+    parser.add_argument(
+        "--p-mins",
+        type=parse_float_list,
+        default=None,
+        help="Optional multi-value p_min sweep; each probability volume is loaded once.",
+    )
+    parser.add_argument(
+        "--p-protects",
+        type=parse_float_list,
+        default=None,
+        help="Optional multi-value p_protect sweep.",
+    )
     parser.add_argument(
         "--betas", type=parse_float_list, default=parse_float_list("0.25,0.5,1,2,3")
     )
@@ -130,16 +148,26 @@ def load_annotation(path: str, probability_name: str) -> pd.DataFrame:
         & frame["image_path"].notna()
     ].copy()
     frame = frame[["case_id", "probability_path", "gt_mask_path", "image_path"]]
+    frame["case_id"] = frame["case_id"].astype(str).str.strip()
     return frame.rename(columns={"probability_path": probability_name})
 
 
 def main() -> None:
     args = parse_args()
-    if not 0 <= args.p_min < args.p_protect <= 1:
-        raise ValueError("Require 0 <= p_min < p_protect <= 1.")
+    p_mins = args.p_mins or [args.p_min]
+    p_protects = args.p_protects or [args.p_protect]
+    band_pairs = [
+        (p_min, p_protect)
+        for p_min in p_mins
+        for p_protect in p_protects
+        if 0 <= p_min < p_protect <= 1
+    ]
+    if not band_pairs:
+        raise ValueError("No valid 0 <= p_min < p_protect <= 1 pairs were supplied.")
     vision = load_annotation(args.vision_annotation_csv, "vision_probability_path")
     dicom = load_annotation(args.dicom_annotation_csv, "dicom_probability_path")
     scores = pd.read_csv(args.normal_scores_csv, encoding="utf-8-sig")
+    scores["case_id"] = scores["case_id"].astype(str).str.strip()
     required_scores = {"case_id", *V7_SCORE_COLUMNS.values()}
     missing_scores = required_scores - set(scores.columns)
     if missing_scores:
@@ -166,6 +194,29 @@ def main() -> None:
     )
     if len(table) != len(vision):
         raise RuntimeError("Normal-score coverage does not match the paired labeled cohort.")
+    if args.split_manifest:
+        split = pd.read_csv(args.split_manifest, encoding="utf-8-sig")
+        required_split = {"case_id", "cohort"}
+        missing_split = required_split - set(split.columns)
+        if missing_split:
+            raise ValueError(
+                f"Split manifest lacks columns: {sorted(missing_split)}"
+            )
+        split["case_id"] = split["case_id"].astype(str).str.strip()
+        if split["case_id"].duplicated().any():
+            raise ValueError("Split manifest contains duplicate case IDs.")
+        if args.cohort_part != "all":
+            split = split[split["cohort"].eq(args.cohort_part)]
+        expected_cases = set(split["case_id"])
+        missing_cases = expected_cases - set(table["case_id"])
+        if missing_cases:
+            raise RuntimeError(
+                f"Probability/scores miss {len(missing_cases)} split cases; "
+                f"examples={sorted(missing_cases)[:5]}"
+            )
+        table = table[table["case_id"].isin(expected_cases)].reset_index(drop=True)
+        if len(table) != len(expected_cases):
+            raise RuntimeError("Split filtering did not produce a one-to-one cohort.")
 
     records: list[dict[str, object]] = []
     for index, row in table.iterrows():
@@ -206,6 +257,8 @@ def main() -> None:
                     "score_mode": score_mode,
                     "beta": 0.0,
                     "text_threshold": np.nan,
+                    "p_min": np.nan,
+                    "p_protect": np.nan,
                     "p_normal": np.nan,
                     **binary_metrics(
                         probability >= args.prob_threshold,
@@ -218,52 +271,59 @@ def main() -> None:
                 }
             )
 
-        fast_prepared = None
-        if args.fast_screen:
-            fast_prepared = prepare_fast_suppression_counts(
-                dicom_probability,
-                target,
-                args.p_min,
-                args.p_protect,
-                args.prob_threshold,
-            )
-        for condition, score_column in V7_SCORE_COLUMNS.items():
-            p_normal = float(row[score_column])
-            for threshold in args.text_thresholds:
-                for beta in args.betas:
-                    if args.fast_screen:
-                        metrics = fast_suppression_metrics(
-                            fast_prepared,
-                            beta * suppression_strength(p_normal, threshold),
+        for p_min, p_protect in band_pairs:
+            fast_prepared = None
+            if args.fast_screen:
+                fast_prepared = prepare_fast_suppression_counts(
+                    dicom_probability,
+                    target,
+                    p_min,
+                    p_protect,
+                    args.prob_threshold,
+                )
+            for condition, score_column in V7_SCORE_COLUMNS.items():
+                p_normal = float(row[score_column])
+                for threshold in args.text_thresholds:
+                    for beta in args.betas:
+                        if args.fast_screen:
+                            metrics = fast_suppression_metrics(
+                                fast_prepared,
+                                beta * suppression_strength(p_normal, threshold),
+                            )
+                        else:
+                            final_probability = suppress_probability(
+                                dicom_probability,
+                                p_normal,
+                                beta,
+                                p_min,
+                                p_protect,
+                                threshold,
+                            )
+                            metrics = binary_metrics(
+                                final_probability >= args.prob_threshold,
+                                target,
+                                spacing_zyx,
+                                target_points,
+                                target_tree,
+                                compute_expensive=True,
+                            )
+                        configuration = (
+                            f"{condition}__pmin{p_min:g}__protect{p_protect:g}"
+                            f"__tau{threshold:g}__beta{beta:g}"
                         )
-                    else:
-                        final_probability = suppress_probability(
-                            dicom_probability,
-                            p_normal,
-                            beta,
-                            args.p_min,
-                            args.p_protect,
-                            threshold,
+                        records.append(
+                            {
+                                "case_id": row["case_id"],
+                                "configuration": configuration,
+                                "score_mode": condition,
+                                "beta": beta,
+                                "text_threshold": threshold,
+                                "p_min": p_min,
+                                "p_protect": p_protect,
+                                "p_normal": p_normal,
+                                **metrics,
+                            }
                         )
-                        metrics = binary_metrics(
-                            final_probability >= args.prob_threshold,
-                            target,
-                            spacing_zyx,
-                            target_points,
-                            target_tree,
-                            compute_expensive=True,
-                        )
-                    records.append(
-                        {
-                            "case_id": row["case_id"],
-                            "configuration": f"{condition}__tau{threshold:g}__beta{beta:g}",
-                            "score_mode": condition,
-                            "beta": beta,
-                            "text_threshold": threshold,
-                            "p_normal": p_normal,
-                            **metrics,
-                        }
-                    )
         if (index + 1) % 50 == 0 or index + 1 == len(table):
             print(f"[MATRIX] processed={index + 1}/{len(table)}", flush=True)
 
@@ -300,14 +360,17 @@ def main() -> None:
     (output_dir / "v7_five_condition_metadata.json").write_text(
         json.dumps(
             {
-                "p_min": args.p_min,
-                "p_protect": args.p_protect,
+                "p_mins": p_mins,
+                "p_protects": p_protects,
+                "valid_band_pairs": band_pairs,
                 "betas": args.betas,
                 "text_thresholds": args.text_thresholds,
                 "paired_labeled_cases": len(table),
                 "v7_probability_base": "frozen DICOM-FiLM",
                 "safety_reference": ["vision_only", "vision_dicom_film"],
                 "fast_screen": bool(args.fast_screen),
+                "split_manifest": args.split_manifest,
+                "cohort_part": args.cohort_part,
             },
             ensure_ascii=False,
             indent=2,

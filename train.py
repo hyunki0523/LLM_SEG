@@ -1,4 +1,4 @@
-import os, json, argparse, sys, site, copy, hashlib, math
+import os, json, argparse, sys, site, copy, hashlib, math, random
 
 # [BUGFIX] bitsandbytes CUDA 12/13 library (libnvJitLink.so) 오류 방지용 동적 경로 주입
 try:
@@ -180,6 +180,10 @@ def run_vision_sw_validation(
     local_metrics = []
     for monitor_index, (dataset_index, case_id, lesion_voxels) in enumerate(local_records):
         sample = dataset.get_full_volume(int(dataset_index))
+        model_kwargs = {}
+        if "dicom_numeric" in sample:
+            model_kwargs["dicom_numeric"] = sample["dicom_numeric"]
+            model_kwargs["dicom_categorical"] = sample["dicom_categorical"]
         logits = predict_sliding_window_return_logits(
             model,
             sample["data"],
@@ -188,6 +192,7 @@ def run_vision_sw_validation(
             step_size=float(step_size),
             mirror_axes=None,
             use_gaussian=True,
+            model_kwargs=model_kwargs,
             accumulation_dtype=torch.float32,
             sw_batch_size=int(sw_batch_size),
         )
@@ -243,6 +248,7 @@ def run_vision_sw_validation(
 
 
 def seed_everything(seed=42):
+    random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -592,15 +598,16 @@ def make_context_tokens_batch(tokenizer, max_length, context_length, contexts, d
 
 
 def main(args):
-    seed_everything()
+    seed_everything(args.seed)
     if args.max_optimizer_steps < 0 or args.warmup_optimizer_steps < 0:
         raise ValueError("Optimizer-step limits must be non-negative.")
     if args.balanced_sampling and not args.vision_manifest:
         raise ValueError("--balanced_sampling requires --vision_manifest.")
     if args.sw_validation:
-        if args.context or args.use_dicom:
+        if args.context:
             raise ValueError(
-                "The first deterministic SW monitor is restricted to Vision-only training."
+                "The deterministic SW monitor currently supports Vision-only and "
+                "DICOM-FiLM training, but not LLM context fusion."
             )
         if not args.vision_manifest or not args.labeled_validation_only:
             raise ValueError(
@@ -660,6 +667,10 @@ def main(args):
         dataloader_config=data_config,
         gradient_accumulation_steps=args.grad_accum
     )
+    # The custom infinite patch loader has no DistributedSampler. Give every
+    # rank an independent deterministic RNG stream so DDP ranks do not train
+    # on identical patches, while DDP still broadcasts rank-0 model weights.
+    seed_everything(args.seed + accelerator.process_index)
 
     # === WandB 실험 이름 및 Config 자동 생성 ===
     eff_batch = args.batch_size * args.grad_accum * accelerator.num_processes
@@ -710,6 +721,7 @@ def main(args):
         "warmup_optimizer_steps": args.warmup_optimizer_steps,
         "sw_validation": args.sw_validation,
         "sw_valid_interval_steps": args.sw_valid_interval_steps,
+        "seed": args.seed,
         "memo": "자동생성된 실험 설정 로그"
     }
 
