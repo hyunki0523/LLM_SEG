@@ -769,8 +769,10 @@ class HemoDataset(Dataset):
                 raise FileNotFoundError(f"Vision sampling manifest not found: {manifest_path}")
             manifest = pd.read_csv(manifest_path, encoding="utf-8-sig")
             required_manifest_columns = {
+                "manifest_schema_version",
                 "case_id",
                 "actual_foreground_voxels",
+                "foreground_space",
                 "supervision_status",
                 "train_eligible",
                 "validation_eligible",
@@ -779,6 +781,20 @@ class HemoDataset(Dataset):
             if missing_manifest_columns:
                 raise ValueError(
                     f"Vision manifest lacks columns: {sorted(missing_manifest_columns)}"
+                )
+            schema_versions = set(
+                pd.to_numeric(manifest["manifest_schema_version"], errors="coerce")
+                .dropna()
+                .astype(int)
+                .tolist()
+            )
+            foreground_spaces = set(
+                manifest["foreground_space"].astype(str).str.strip().tolist()
+            )
+            if schema_versions != {2} or foreground_spaces != {"image_aligned"}:
+                raise ValueError(
+                    "Vision manifest must use schema v2 image-aligned foreground "
+                    f"statistics; versions={schema_versions}, spaces={foreground_spaces}."
                 )
             manifest["case_id"] = manifest["case_id"].astype(str).str.strip()
             if manifest["case_id"].duplicated().any():

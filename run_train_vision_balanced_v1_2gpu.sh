@@ -6,7 +6,7 @@ PYTHON_EXE="${PYTHON_EXE:-python}"
 GPU_PAIR="${GPU_PAIR:-0,1}"
 TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
-MANIFEST="${MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v1.csv}"
+MANIFEST="${MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v11.csv}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 SEED="${SEED:-42}"
 if [ -z "${CHECKPOINT_DIR:-}" ]; then

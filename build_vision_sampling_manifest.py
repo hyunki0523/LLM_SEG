@@ -24,6 +24,8 @@ DEFAULT_MASK_DIRS = (
     "/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/FUdata/hemo_masks/thin_th0.56",
     "/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/FUdata/normal_masks",
 )
+DEFAULT_IMAGE_PATH_REWRITE_FROM = "/mnt/nas100/Brain_ER/data/BrainCT_NIfTIv2"
+DEFAULT_IMAGE_PATH_REWRITE_TO = "/mnt/nas100/Brain_ER/IDs/kevin/BrainCT_NIfTIv2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,6 +41,14 @@ def parse_args() -> argparse.Namespace:
         help="Mask search directory. Repeat to override the default three directories.",
     )
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--image-path-rewrite-from",
+        default=DEFAULT_IMAGE_PATH_REWRITE_FROM,
+    )
+    parser.add_argument(
+        "--image-path-rewrite-to",
+        default=DEFAULT_IMAGE_PATH_REWRITE_TO,
+    )
     return parser.parse_args()
 
 
@@ -70,20 +80,67 @@ def file_sha256(path: str) -> str:
     return digest.hexdigest()
 
 
-def mask_statistics(path: str) -> tuple[int, int, str]:
+def resolve_image_path(raw_path: str, rewrite_from: str, rewrite_to: str) -> str:
+    raw = str(raw_path).strip()
+    original = Path(raw)
+    source = str(rewrite_from).strip().rstrip("/\\")
+    destination = str(rewrite_to).strip().rstrip("/\\")
+    if bool(source) ^ bool(destination):
+        raise ValueError("Set both image path rewrite arguments, or neither.")
+    if source:
+        if raw == source:
+            raw = destination
+        elif raw.startswith(source + "/") or raw.startswith(source + "\\"):
+            suffix = raw[len(source) :].lstrip("/\\")
+            raw = f"{destination}/{suffix}"
+    rewritten = Path(raw)
+    if rewritten != original and not rewritten.exists() and original.exists():
+        return str(original)
+    return str(rewritten)
+
+
+def mask_statistics(task: tuple[str, str]) -> tuple[int, int, int, str]:
+    """Measure foreground in the same image-aligned space used by HemoDataset."""
+    path, image_path = task
     if not path:
-        return 0, 0, "missing"
+        return 0, 0, 0, "missing"
+    if not image_path or not Path(image_path).is_file():
+        return 0, 0, 0, "missing_image"
     try:
         try:
-            array = np.asanyarray(nib.load(path).dataobj)
-        except Exception:
-            array = sitk.GetArrayFromImage(sitk.ReadImage(path))
-        foreground = np.asarray(array > 0, dtype=bool)
-        voxels = int(foreground.sum())
-        components = int(label(foreground)[1]) if voxels else 0
-        return voxels, components, "ok"
+            mask_itk = sitk.ReadImage(path)
+            raw_array = sitk.GetArrayFromImage(mask_itk)
+            nib_fallback = False
+        except RuntimeError:
+            nib_image = nib.load(path)
+            raw_array = np.asarray(nib_image.dataobj)
+            mask_itk = None
+            nib_fallback = True
+        raw_voxels = int(np.count_nonzero(raw_array > 0))
+        if raw_voxels == 0:
+            return 0, 0, 0, "ok"
+
+        reference = sitk.ReadImage(image_path)
+        if nib_fallback:
+            mask_itk = sitk.GetImageFromArray(raw_array)
+            mask_itk.SetOrigin(reference.GetOrigin())
+            mask_itk.SetSpacing(reference.GetSpacing())
+            mask_itk.SetDirection(reference.GetDirection())
+        aligned = sitk.Resample(
+            mask_itk,
+            reference,
+            sitk.Transform(),
+            sitk.sitkNearestNeighbor,
+            0,
+            mask_itk.GetPixelID(),
+        )
+        aligned_array = sitk.GetArrayFromImage(aligned)
+        foreground = np.asarray(aligned_array > 0, dtype=bool)
+        aligned_voxels = int(foreground.sum())
+        components = int(label(foreground)[1]) if aligned_voxels else 0
+        return raw_voxels, aligned_voxels, components, "ok"
     except Exception as exc:
-        return 0, 0, f"read_error:{type(exc).__name__}"
+        return 0, 0, 0, f"read_error:{type(exc).__name__}"
 
 
 def mask_case_id(path: Path) -> str:
@@ -126,6 +183,8 @@ def prepare_rows(
     path: str,
     split: str,
     mask_index: dict[str, Path],
+    image_path_rewrite_from: str,
+    image_path_rewrite_to: str,
 ) -> list[dict[str, object]]:
     frame = read_dataset_table(path)
     case_column = case_id_column(frame)
@@ -145,11 +204,17 @@ def prepare_rows(
             raise ValueError(f"Missing class label for {case_id} in {path}")
         class_text = str(class_value).strip()
         class_is_positive = class_text.lower() != "normal"
+        image_path = resolve_image_path(
+            str(row.get("image_path", "")),
+            image_path_rewrite_from,
+            image_path_rewrite_to,
+        )
         rows.append(
             {
+                "manifest_schema_version": 2,
                 "case_id": case_id,
                 "split": split,
-                "image_path": str(row.get("image_path", "")),
+                "image_path": image_path,
                 "mask_path": str(mask_path) if mask_path is not None else "",
                 "mask_exists": bool(mask_path is not None),
                 "class_text": class_text,
@@ -166,20 +231,35 @@ def main() -> None:
         raise FileExistsError(f"Manifest already exists: {output}; use --overwrite")
     mask_dirs = tuple(args.mask_dirs or DEFAULT_MASK_DIRS)
     mask_index = build_mask_index(mask_dirs)
-    rows = prepare_rows(args.train_csv, "train", mask_index) + prepare_rows(
-        args.valid_csv, "valid", mask_index
+    rows = prepare_rows(
+        args.train_csv,
+        "train",
+        mask_index,
+        args.image_path_rewrite_from,
+        args.image_path_rewrite_to,
+    ) + prepare_rows(
+        args.valid_csv,
+        "valid",
+        mask_index,
+        args.image_path_rewrite_from,
+        args.image_path_rewrite_to,
     )
-    tasks = [str(row["mask_path"]) for row in rows]
+    tasks = [(str(row["mask_path"]), str(row["image_path"])) for row in rows]
     with ProcessPoolExecutor(max_workers=max(1, args.workers)) as executor:
         statistics = executor.map(mask_statistics, tasks, chunksize=16)
         for index, (row, stats) in enumerate(zip(rows, statistics)):
-            voxels, components, read_status = stats
+            raw_voxels, voxels, components, read_status = stats
+            row["raw_foreground_voxels"] = raw_voxels
             row["actual_foreground_voxels"] = voxels
             row["foreground_components"] = components
+            row["foreground_space"] = "image_aligned"
             row["mask_read_status"] = read_status
             class_positive = bool(row["class_is_positive"])
             mask_exists = bool(row["mask_exists"])
-            if read_status.startswith("read_error"):
+            if read_status == "missing_image":
+                supervision_status = "invalid_missing_image"
+                train_eligible = validation_eligible = False
+            elif read_status.startswith("read_error"):
                 supervision_status = "invalid_mask_read_error"
                 train_eligible = validation_eligible = False
             elif class_positive and voxels > 0:
@@ -189,7 +269,11 @@ def main() -> None:
                 supervision_status = "invalid_positive_missing_mask"
                 train_eligible = validation_eligible = False
             elif class_positive:
-                supervision_status = "invalid_positive_empty_mask"
+                supervision_status = (
+                    "invalid_positive_empty_after_alignment"
+                    if raw_voxels > 0
+                    else "invalid_positive_empty_mask"
+                )
                 train_eligible = validation_eligible = False
             elif voxels > 0:
                 supervision_status = "invalid_normal_nonempty_mask"
@@ -228,12 +312,15 @@ def main() -> None:
     summary.to_csv(temporary_summary, index=False, encoding="utf-8-sig")
     os.replace(temporary_summary, summary_output)
     metadata = {
-        "schema_version": 1,
+        "schema_version": 2,
         "train_csv": str(args.train_csv),
         "valid_csv": str(args.valid_csv),
         "train_csv_sha256": file_sha256(args.train_csv),
         "valid_csv_sha256": file_sha256(args.valid_csv),
         "mask_dirs": list(mask_dirs),
+        "image_path_rewrite_from": args.image_path_rewrite_from,
+        "image_path_rewrite_to": args.image_path_rewrite_to,
+        "foreground_space": "image_aligned",
         "rows": int(len(frame)),
         "train_eligible": int(frame["train_eligible"].sum()),
         "validation_eligible": int(frame["validation_eligible"].sum()),

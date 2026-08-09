@@ -7,7 +7,7 @@ set -euo pipefail
 PROJECT_DIR="${PROJECT_DIR:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/LLM_SEG_hk}"
 PYTHON_EXE="${PYTHON_EXE:-python}"
 RESULT_ROOT="${RESULT_ROOT:-}"
-VISION_MANIFEST="${VISION_MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v1.csv}"
+VISION_MANIFEST="${VISION_MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v11.csv}"
 P_MIN_VALUES="${P_MIN_VALUES:-0.1,0.2,0.3}"
 P_PROTECT_VALUES="${P_PROTECT_VALUES:-0.85,0.90,0.95}"
 BETAS="${BETAS:-0.1,0.25,0.5,0.75,1,1.5,2,3}"
