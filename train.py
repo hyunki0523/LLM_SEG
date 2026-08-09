@@ -665,7 +665,11 @@ def main(args):
         log_with='wandb',
         kwargs_handlers=[kwargs, ipg_handler],
         dataloader_config=data_config,
-        gradient_accumulation_steps=args.grad_accum
+        gradient_accumulation_steps=args.grad_accum,
+        # Our schedule is defined in explicit global optimizer updates. With
+        # split_batches=False, AcceleratedScheduler otherwise advances once per
+        # process for every call and makes a 2-GPU cosine schedule run 2x fast.
+        step_scheduler_with_optimizer=False,
     )
     # The custom infinite patch loader has no DistributedSampler. Give every
     # rank an independent deterministic RNG stream so DDP ranks do not train
@@ -1198,6 +1202,17 @@ def main(args):
         f"[OPTIMIZER STEPS] starting_at={global_optimizer_step} "
         f"target={total_optimizer_steps}"
     )
+    scheduler_update_step = int(scheduler.state_dict().get("last_epoch", -1))
+    if (
+        args.max_optimizer_steps > 0
+        and scheduler_update_step >= 0
+        and scheduler_update_step != global_optimizer_step
+    ):
+        raise RuntimeError(
+            "Scheduler/optimizer update mismatch: "
+            f"scheduler={scheduler_update_step}, optimizer={global_optimizer_step}. "
+            "Do not resume a pre-fix balanced checkpoint; use a fresh checkpoint directory."
+        )
     base = accelerator.unwrap_model(model)
     print("[CHECK] context flag:", getattr(base, "context", None))
     print("[CHECK] has tokenizer:", hasattr(base, "tokenizer"))
@@ -1291,6 +1306,7 @@ def main(args):
 
         for n_iter in progress_bar:
             batch = next(train_iter)
+            optimizer_step_skipped = False
 
             if "patch_has_foreground" in batch:
                 patch_flags = batch["patch_has_foreground"]
@@ -1547,7 +1563,9 @@ def main(args):
                 # accelerate가 SequentialLR 등 복합 스케줄러의 step()을 자동으로 
                 # 건너뛰지(skip) 못하는 버그(Mismatched state)를 방지하기 위해 강제로 묶음
                 if accelerator.sync_gradients:
-                    scheduler.step()
+                    optimizer_step_skipped = accelerator.optimizer_step_was_skipped
+                    if not optimizer_step_skipped:
+                        scheduler.step()
 
             # Loss 누적 (NaN이 아닌 경우만)
             if not global_is_bad:
@@ -1558,7 +1576,7 @@ def main(args):
                 acc_step_count += 1
 
             # accelerator.sync_gradients = TRUE 일 때가 실제 1개 축적 사이클이 완료된 시점입니다.
-            if accelerator.sync_gradients:
+            if accelerator.sync_gradients and not optimizer_step_skipped:
                 global_optimizer_step += 1
                 avg_acc_loss = accumulated_loss / max(acc_step_count, 1)
                 avg_seg_loss = accumulated_seg_loss / max(acc_step_count, 1)
@@ -1618,6 +1636,21 @@ def main(args):
                 progress_bar.set_postfix({'loss': f'{avg_acc_loss:.4f}'})
 
                 # Reset accumulator for next cycle
+                accumulated_loss = 0.0
+                accumulated_seg_loss = 0.0
+                accumulated_cls_loss = 0.0
+                acc_step_count = 0
+                accumulated_patch_fg_sum = 0.0
+                accumulated_patch_count = 0
+                accumulated_sampling_counts = {
+                    "foreground": 0,
+                    "positive_random": 0,
+                    "normal_random": 0,
+                }
+            elif accelerator.sync_gradients:
+                accelerator.print(
+                    "[OPTIMIZER] Update skipped; LR scheduler and EMA were not advanced."
+                )
                 accumulated_loss = 0.0
                 accumulated_seg_loss = 0.0
                 accumulated_cls_loss = 0.0
@@ -1959,6 +1992,17 @@ def main(args):
             args.checkpoint_interval > 0 and epoch % args.checkpoint_interval == 0
         )
         if periodic_checkpoint or sw_validation_ran or global_optimizer_step >= total_optimizer_steps:
+            scheduler_update_step = int(
+                scheduler.state_dict().get("last_epoch", -1)
+            )
+            if (
+                args.max_optimizer_steps > 0
+                and scheduler_update_step != global_optimizer_step
+            ):
+                raise RuntimeError(
+                    "Refusing to save a mismatched schedule: "
+                    f"scheduler={scheduler_update_step}, optimizer={global_optimizer_step}."
+                )
             unwrapped = accelerator.unwrap_model(ema_model.module if ema_model is not None else model)
             checkpoint = {
                 'model': trainable_state_dict(unwrapped, include_buffers=True),  # ✅ trainable만
@@ -1967,6 +2011,7 @@ def main(args):
                 'val_dice': val_dice_for_this_epoch,
                 'epoch': epoch,
                 'optimizer_step': global_optimizer_step,
+                'scheduler_update_step': scheduler_update_step,
                 'best_sw_dice': best_sw_dice,
                 'dicom_schema': dicom_schema,
             }

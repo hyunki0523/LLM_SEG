@@ -73,13 +73,13 @@ contains_job() {
 checkpoint_for() {
     local job="$1"
     if [ "$SMOKE_TEST" = "1" ]; then
-        echo "${EXPERIMENT_ROOT}/balanced_v1_6gpu_smoke/${job}"
+        echo "${EXPERIMENT_ROOT}/balanced_v11_6gpu_smoke/${job}"
         return
     fi
     case "$job" in
-        dicom_seed42) echo "${EXPERIMENT_ROOT}/dicom_film_balanced_v1/seed42" ;;
-        vision_seed43) echo "${EXPERIMENT_ROOT}/vision_balanced_v1/seed43" ;;
-        dicom_seed43) echo "${EXPERIMENT_ROOT}/dicom_film_balanced_v1/seed43" ;;
+        dicom_seed42) echo "${EXPERIMENT_ROOT}/dicom_film_balanced_v11/seed42" ;;
+        vision_seed43) echo "${EXPERIMENT_ROOT}/vision_balanced_v11/vision_only_seed43" ;;
+        dicom_seed43) echo "${EXPERIMENT_ROOT}/dicom_film_balanced_v11/seed43" ;;
         *) echo "[ERROR] Unknown job: $job" >&2; return 2 ;;
     esac
 }

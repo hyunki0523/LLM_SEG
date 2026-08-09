@@ -8,18 +8,19 @@ TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/2606
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
 MANIFEST="${MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v1.csv}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
+SEED="${SEED:-42}"
 if [ -z "${CHECKPOINT_DIR:-}" ]; then
     if [ "$SMOKE_TEST" = "1" ]; then
-        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v1/smoke"
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v11/smoke_seed${SEED}"
     else
-        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v1/vision_only_balanced_v1"
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v11/vision_only_seed${SEED}"
     fi
 fi
 run_kind="full"
 if [ "$SMOKE_TEST" = "1" ]; then
     run_kind="smoke"
 fi
-LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/vision_balanced_v1_2gpu_${run_kind}_$(date +%Y%m%d_%H%M%S)}"
+LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/vision_balanced_v11_2gpu_${run_kind}_seed${SEED}_$(date +%Y%m%d_%H%M%S)}"
 
 PATCH_SIZE="${PATCH_SIZE:-32 224 224}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
@@ -29,8 +30,7 @@ MAX_OPTIMIZER_STEPS="${MAX_OPTIMIZER_STEPS:-5000}"
 WARMUP_OPTIMIZER_STEPS="${WARMUP_OPTIMIZER_STEPS:-250}"
 EPOCHS="${EPOCHS:-313}"
 LR="${LR:-1e-5}"
-SEED="${SEED:-42}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-vision_balanced_v1_seed${SEED}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-vision_balanced_v11_seed${SEED}}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 SW_VALID_INTERVAL_STEPS="${SW_VALID_INTERVAL_STEPS:-500}"
 SW_VALID_POSITIVE_CASES="${SW_VALID_POSITIVE_CASES:-128}"

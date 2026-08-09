@@ -12,13 +12,13 @@ VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/2606
 MANIFEST="${MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v1.csv}"
 SMOKE_TEST="${SMOKE_TEST:-0}"
 SEED="${SEED:-42}"
-EXPERIMENT_NAME="${EXPERIMENT_NAME:-dicom_film_balanced_v1_seed${SEED}}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-dicom_film_balanced_v11_seed${SEED}}"
 
 if [ -z "${CHECKPOINT_DIR:-}" ]; then
     if [ "$SMOKE_TEST" = "1" ]; then
-        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/dicom_film_balanced_v1/smoke_seed${SEED}"
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/dicom_film_balanced_v11/smoke_seed${SEED}"
     else
-        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/dicom_film_balanced_v1/seed${SEED}"
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/dicom_film_balanced_v11/seed${SEED}"
     fi
 fi
 run_kind="full"
