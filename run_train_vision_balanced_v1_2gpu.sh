@@ -7,8 +7,19 @@ GPU_PAIR="${GPU_PAIR:-0,1}"
 TRAIN_CSV="${TRAIN_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_train_set.xlsx}"
 VALID_CSV="${VALID_CSV:-/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/FUdata/260601/final_valid_set.xlsx}"
 MANIFEST="${MANIFEST:-${PROJECT_DIR}/data_manifests/vision_balanced_v1.csv}"
-CHECKPOINT_DIR="${CHECKPOINT_DIR:-/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v1/vision_only_balanced_v1}"
-LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/vision_balanced_v1_2gpu_$(date +%Y%m%d_%H%M%S)}"
+SMOKE_TEST="${SMOKE_TEST:-0}"
+if [ -z "${CHECKPOINT_DIR:-}" ]; then
+    if [ "$SMOKE_TEST" = "1" ]; then
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v1/smoke"
+    else
+        CHECKPOINT_DIR="/mnt/nas125/forGPU2/lhyunki/llmseg/experiments/fudata_final/llama/vision_balanced_v1/vision_only_balanced_v1"
+    fi
+fi
+run_kind="full"
+if [ "$SMOKE_TEST" = "1" ]; then
+    run_kind="smoke"
+fi
+LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/vision_balanced_v1_2gpu_${run_kind}_$(date +%Y%m%d_%H%M%S)}"
 
 PATCH_SIZE="${PATCH_SIZE:-32 224 224}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
@@ -25,9 +36,14 @@ SW_VALID_NORMAL_CASES="${SW_VALID_NORMAL_CASES:-128}"
 SW_VALID_BATCH_SIZE="${SW_VALID_BATCH_SIZE:-4}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-32}"
 MANIFEST_WORKERS="${MANIFEST_WORKERS:-12}"
-SMOKE_TEST="${SMOKE_TEST:-0}"
 MANIFEST_ONLY="${MANIFEST_ONLY:-0}"
-AUTO_RESUME="${AUTO_RESUME:-1}"
+if [ -z "${AUTO_RESUME:-}" ]; then
+    if [ "$SMOKE_TEST" = "1" ]; then
+        AUTO_RESUME=0
+    else
+        AUTO_RESUME=1
+    fi
+fi
 
 export LLMSEG_IMAGE_PATH_REWRITE_FROM="${LLMSEG_IMAGE_PATH_REWRITE_FROM:-/mnt/nas100/Brain_ER/data/BrainCT_NIfTIv2}"
 export LLMSEG_IMAGE_PATH_REWRITE_TO="${LLMSEG_IMAGE_PATH_REWRITE_TO:-/mnt/nas100/Brain_ER/IDs/kevin/BrainCT_NIfTIv2}"
