@@ -35,6 +35,7 @@ inference_recent.log
 tea_debug.log
 *_launcher.log
 dataset_contract_report.json
+data_manifests/
 wandb_key.txt
 
 # Large local datasets/artifacts

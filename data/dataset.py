@@ -16,13 +16,14 @@ except ImportError:
     )
 import SimpleITK as sitk
 import nibabel as nib
+from scipy.ndimage import label as connected_component_label
 # NIfTI 헤더의 비직교 direction cosine 허용 (일부 마스크 파일 호환)
 sitk.ProcessObject.SetGlobalDefaultDirectionTolerance(1e-3)
 import torch
 from threadpoolctl import threadpool_limits
 from data.transform_nnunet import get_training_transforms, get_validation_transforms
 from utils.mask_paths import find_case_mask_path
-from typing import Dict, Iterable, Optional, Sequence, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 
 DEFAULT_IMAGE_PATH_REWRITE_FROM = "/mnt/nas100/Brain_ER/data/BrainCT_NIfTIv2"
@@ -67,6 +68,27 @@ def read_dataset_table(path: Union[str, Path]) -> pd.DataFrame:
         except UnicodeDecodeError as exc:
             last_error = exc
     raise RuntimeError(f"Could not decode dataset table: {path}") from last_error
+
+
+def _strict_bool_series(series: pd.Series, column: str) -> pd.Series:
+    if pd.api.types.is_bool_dtype(series):
+        return series.astype(bool)
+    normalized = series.astype(str).str.strip().str.lower()
+    mapping = {
+        "true": True,
+        "1": True,
+        "yes": True,
+        "false": False,
+        "0": False,
+        "no": False,
+    }
+    unknown = ~normalized.isin(mapping)
+    if unknown.any():
+        examples = sorted(normalized[unknown].unique().tolist())[:5]
+        raise ValueError(
+            f"Vision manifest column '{column}' has invalid booleans: {examples}"
+        )
+    return normalized.map(mapping).astype(bool)
 
 
 def _clean_text(value) -> str:
@@ -369,7 +391,7 @@ def windowing_3ch(img):
         axis=0
         )
 
-def get_valid_center_with_jitter(base_center, patch_size, image_shape, jitter_range=0.5):
+def get_valid_center_with_jitter(base_center, patch_size, image_shape, jitter_range=0.25):
     """
     bleeding 위치 주변에서 약간의 random offset을 준 center 계산 - 배치를 뽑아올때 무작위성 추가
     """
@@ -411,15 +433,17 @@ def extract_patches(image, mask,
     image = np.pad(image, pad_width, mode='constant', constant_values=-1024)
     mask = np.pad(mask, pad_width, mode='constant', constant_values=0)
 
-    # Extract bleeding locations from the mask
-    unique_indexs = np.unique(mask)
-    foreground_classes = unique_indexs[unique_indexs > 0]
-
-    if len(foreground_classes) == 0:
+    # Sample connected components uniformly so a large hematoma does not make
+    # punctate hemorrhages almost impossible to select.
+    if not sample_positive:
         bleeding_indices = []
     else:
-        random_index = np.random.choice(foreground_classes, size=1, replace=False)
-        bleeding_indices = np.argwhere(mask == random_index[0])
+        component_map, component_count = connected_component_label(mask > 0)
+        if component_count == 0:
+            bleeding_indices = []
+        else:
+            component_id = random.randint(1, int(component_count))
+            bleeding_indices = np.argwhere(component_map == component_id)
 
     if sample_positive and len(bleeding_indices) > 0:
         base_center = random.choice(bleeding_indices)
@@ -683,6 +707,9 @@ class HemoDataset(Dataset):
         dicom_schema: Optional[Dict[str, object]] = None,
         exclude_case_ids: Optional[Iterable[str]] = None,
         deduplicate_case_ids: bool = True,
+        vision_manifest_path: Optional[Union[str, Path]] = None,
+        filter_invalid_supervision: bool = False,
+        labeled_validation_only: bool = False,
         prompt_args: Optional[SimpleNamespace] = None,
         csv_path: Optional[Union[str, Path]] = None, 
     ):
@@ -733,6 +760,76 @@ class HemoDataset(Dataset):
                     "the validation split."
                 )
 
+        self.vision_manifest = None
+        self.positive_indices: List[int] = []
+        self.negative_indices: List[int] = []
+        if vision_manifest_path:
+            manifest_path = Path(vision_manifest_path)
+            if not manifest_path.exists():
+                raise FileNotFoundError(f"Vision sampling manifest not found: {manifest_path}")
+            manifest = pd.read_csv(manifest_path, encoding="utf-8-sig")
+            required_manifest_columns = {
+                "case_id",
+                "actual_foreground_voxels",
+                "supervision_status",
+                "train_eligible",
+                "validation_eligible",
+            }
+            missing_manifest_columns = required_manifest_columns - set(manifest.columns)
+            if missing_manifest_columns:
+                raise ValueError(
+                    f"Vision manifest lacks columns: {sorted(missing_manifest_columns)}"
+                )
+            manifest["case_id"] = manifest["case_id"].astype(str).str.strip()
+            if manifest["case_id"].duplicated().any():
+                raise ValueError("Vision manifest contains duplicate case_id rows.")
+            self.vision_manifest = manifest.set_index("case_id", drop=False)
+            case_ids = self.df[self.case_id_col].astype(str).str.strip()
+            missing_manifest = ~case_ids.isin(self.vision_manifest.index)
+            if missing_manifest.any():
+                examples = case_ids[missing_manifest].head(5).tolist()
+                raise ValueError(
+                    f"Vision manifest misses {int(missing_manifest.sum())} dataset cases; "
+                    f"examples={examples}"
+                )
+            if filter_invalid_supervision:
+                eligibility_column = (
+                    "validation_eligible" if mode == "valid" else "train_eligible"
+                )
+                eligible_by_case = _strict_bool_series(
+                    self.vision_manifest[eligibility_column], eligibility_column
+                )
+                keep = case_ids.map(eligible_by_case).fillna(False).to_numpy(dtype=bool)
+                removed = int((~keep).sum())
+                self.df = self.df.loc[keep].reset_index(drop=True)
+                print(
+                    f"[VISION MANIFEST] {mode}: removed {removed} invalid-supervision rows; "
+                    f"{len(self.df)} remain."
+                )
+            if labeled_validation_only and mode == "valid":
+                case_ids = self.df[self.case_id_col].astype(str).str.strip()
+                eligible_by_case = _strict_bool_series(
+                    self.vision_manifest["validation_eligible"],
+                    "validation_eligible",
+                )
+                keep = case_ids.map(eligible_by_case).fillna(False).to_numpy(dtype=bool)
+                removed = int((~keep).sum())
+                self.df = self.df.loc[keep].reset_index(drop=True)
+                print(
+                    f"[VISION MANIFEST] valid: excluded {removed} unlabeled/inconsistent rows; "
+                    f"{len(self.df)} labeled cases remain."
+                )
+
+            case_ids = self.df[self.case_id_col].astype(str).str.strip()
+            foreground_by_case = self.vision_manifest["actual_foreground_voxels"].astype(int)
+            foreground_voxels = case_ids.map(foreground_by_case).fillna(0).to_numpy()
+            self.positive_indices = np.flatnonzero(foreground_voxels > 0).astype(int).tolist()
+            self.negative_indices = np.flatnonzero(foreground_voxels == 0).astype(int).tolist()
+            print(
+                f"[VISION MANIFEST] {mode}: positive_pool={len(self.positive_indices)} "
+                f"negative_pool={len(self.negative_indices)}"
+            )
+
         print(f'Number of {mode} samples: {len(self.df)}')
         self.image_path_rewrite_from = os.environ.get(
             "LLMSEG_IMAGE_PATH_REWRITE_FROM", DEFAULT_IMAGE_PATH_REWRITE_FROM
@@ -766,6 +863,18 @@ class HemoDataset(Dataset):
                     raise RuntimeError(
                         f"No {mode} samples remain after filtering missing image files: {self.csv_path}"
                     )
+        if self.vision_manifest is not None:
+            case_ids = self.df[self.case_id_col].astype(str).str.strip()
+            foreground_by_case = self.vision_manifest[
+                "actual_foreground_voxels"
+            ].astype(int)
+            foreground_voxels = case_ids.map(foreground_by_case).fillna(0).to_numpy()
+            self.positive_indices = np.flatnonzero(
+                foreground_voxels > 0
+            ).astype(int).tolist()
+            self.negative_indices = np.flatnonzero(
+                foreground_voxels == 0
+            ).astype(int).tolist()
 
         # 2) 데이터
         self.image_root = Path('/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/pair_data_nifti')
@@ -922,8 +1031,42 @@ class HemoDataset(Dataset):
         arr = sitk.GetArrayFromImage(mask_rs)  # (D,H,W)  ✅ ref와 동일 shape
         return arr
 
+    def get_full_volume(self, idx: int) -> Dict[str, object]:
+        """Load a deterministic full volume for sliding-window validation."""
+        row = self.df.loc[idx]
+        case_id = str(row[self.case_id_col]).strip()
+        if 'image_path' in row and pd.notna(row['image_path']):
+            img_path = self._resolve_image_path(row['image_path'])
+        else:
+            img_path = self._resolve_image_path(self.image_root / f"{case_id}.nii.gz")
+        explicit_mask_path = None
+        if 'mask_path' in row and pd.notna(row['mask_path']):
+            explicit_mask_path = Path(str(row['mask_path']).strip())
+        mask_path = find_case_mask_path(case_id, explicit_mask_path, self.mask_search_dirs)
+        if not img_path.exists():
+            raise FileNotFoundError(f"Missing image: {img_path}")
+        if mask_path is None or not mask_path.exists():
+            raise FileNotFoundError(
+                f"Full-volume validation requires an explicit mask for {case_id}."
+            )
+        img, ref_img = self._sitk_read_img_and_ref(img_path)
+        mask = self._sitk_read_mask_resample_to_ref(mask_path, ref_img)
+        if img.shape != mask.shape:
+            img, mask = match_img_mask_shape(
+                img, mask, pad_value_img=-1024, pad_value_mask=0
+            )
+        image_tensor = torch.from_numpy(
+            ((windowing_3ch(img) - 0.5) / 0.5).astype(np.float32, copy=False)
+        )
+        return {
+            'data': image_tensor,
+            'target': torch.from_numpy((mask > 0).astype(np.uint8, copy=False)),
+            'case_id': case_id,
+            'image_path': str(img_path),
+            'mask_path': str(mask_path),
+        }
 
-    def __getitem__(self, idx, sample_positive=True):
+    def __getitem__(self, idx, sample_positive=True, sampling_mode=None):
         row = self.df.loc[idx]
         case_id = str(row[self.case_id_col]).strip()
 
@@ -993,6 +1136,10 @@ class HemoDataset(Dataset):
             'case_id': case_id,
             'hemorrhage_burden': np.float32(hemorrhage_burden),
             'trauma_target': np.float32(trauma_target),
+            'sampling_mode': sampling_mode or (
+                'foreground_attempt' if sample_positive else 'random'
+            ),
+            'patch_has_foreground': np.float32(bool(mask.any())),
         }
         if self.use_dicom:
             sample['dicom_numeric'] = self.dicom_numeric[idx]
@@ -1002,18 +1149,62 @@ class HemoDataset(Dataset):
     
 
 class HemoDataLoader3D(DataLoader):
-    def __init__(self, dataset, batch_size, transforms=None, positive_prob=0.8):
+    def __init__(
+        self,
+        dataset,
+        batch_size,
+        transforms=None,
+        positive_prob=0.8,
+        balanced_sampling=False,
+    ):
         super().__init__(dataset, batch_size, infinite=True)
         self.dataset = dataset
         self.transforms = transforms
         self.positive_prob = positive_prob
+        self.balanced_sampling = bool(balanced_sampling)
+        self._sampling_cycle = []
+        if self.balanced_sampling:
+            if not self.dataset.positive_indices or not self.dataset.negative_indices:
+                raise ValueError(
+                    "Balanced sampling requires non-empty positive and negative manifest pools."
+                )
+            self._refill_sampling_cycle()
+
+    def _refill_sampling_cycle(self):
+        # Exact 50/25/25 composition over every four samples. Shuffling avoids
+        # a fixed foreground/background order when local batch size is two.
+        self._sampling_cycle = [
+            "foreground",
+            "foreground",
+            "positive_random",
+            "normal_random",
+        ]
+        random.shuffle(self._sampling_cycle)
+
+    def _next_sampling_mode(self):
+        if not self._sampling_cycle:
+            self._refill_sampling_cycle()
+        return self._sampling_cycle.pop()
+
+    def _sample_balanced_index(self, mode):
+        pool = (
+            self.dataset.negative_indices
+            if mode == "normal_random"
+            else self.dataset.positive_indices
+        )
+        return int(random.choice(pool))
 
     def get_indices(self):
         indices = np.random.choice(range(len(self.dataset.df)), size=self.batch_size, replace=False)
         return indices
 
     def generate_train_batch(self):
-        indices = self.get_indices()
+        if self.balanced_sampling:
+            sampling_modes = [self._next_sampling_mode() for _ in range(self.batch_size)]
+            indices = [self._sample_balanced_index(mode) for mode in sampling_modes]
+        else:
+            indices = self.get_indices()
+            sampling_modes = [None] * self.batch_size
         data_all = []
         seg_all = []
         image_path_all = []
@@ -1023,10 +1214,20 @@ class HemoDataLoader3D(DataLoader):
         dicom_categorical_all = []
         hemorrhage_burden_all = []
         trauma_target_all = []
+        sampling_mode_all = []
+        patch_has_foreground_all = []
 
         for j, idx in enumerate(indices):
-            if random.random() < self.positive_prob:
-                data_dict = self._data.__getitem__(idx, sample_positive=True) 
+            sampling_mode = sampling_modes[j]
+            if self.balanced_sampling:
+                sample_positive = sampling_mode == "foreground"
+                data_dict = self._data.__getitem__(
+                    idx,
+                    sample_positive=sample_positive,
+                    sampling_mode=sampling_mode,
+                )
+            elif random.random() < self.positive_prob:
+                data_dict = self._data.__getitem__(idx, sample_positive=True)
             else:
                 data_dict = self._data.__getitem__(idx, sample_positive=False)
             data_all.append(data_dict['data'])
@@ -1036,6 +1237,8 @@ class HemoDataLoader3D(DataLoader):
             case_id_all.append(data_dict['case_id'])
             hemorrhage_burden_all.append(data_dict['hemorrhage_burden'])
             trauma_target_all.append(data_dict['trauma_target'])
+            sampling_mode_all.append(data_dict['sampling_mode'])
+            patch_has_foreground_all.append(data_dict['patch_has_foreground'])
             if self.dataset.use_dicom:
                 dicom_numeric_all.append(data_dict['dicom_numeric'])
                 dicom_categorical_all.append(data_dict['dicom_categorical'])
@@ -1045,6 +1248,9 @@ class HemoDataLoader3D(DataLoader):
         image_path_all = np.stack(image_path_all)
         hemorrhage_burden_all = np.asarray(hemorrhage_burden_all, dtype=np.float32)
         trauma_target_all = np.asarray(trauma_target_all, dtype=np.float32)
+        patch_has_foreground_all = np.asarray(
+            patch_has_foreground_all, dtype=np.float32
+        )
         if self.dataset.use_dicom:
             dicom_numeric_all = np.stack(dicom_numeric_all)
             dicom_categorical_all = np.stack(dicom_categorical_all)
@@ -1059,6 +1265,8 @@ class HemoDataLoader3D(DataLoader):
         case_id_all = list(np.array(case_id_all)[indices])
         hemorrhage_burden_all = hemorrhage_burden_all[indices]
         trauma_target_all = trauma_target_all[indices]
+        sampling_mode_all = list(np.array(sampling_mode_all)[indices])
+        patch_has_foreground_all = patch_has_foreground_all[indices]
         if self.dataset.use_dicom:
             dicom_numeric_all = dicom_numeric_all[indices]
             dicom_categorical_all = dicom_categorical_all[indices]
@@ -1081,6 +1289,13 @@ class HemoDataLoader3D(DataLoader):
                         seg_all = [torch.stack([s[i] for s in segs]) for i in range(len(segs[0]))]
                     else:
                         seg_all = torch.stack(segs)
+                    full_resolution_seg = seg_all[0] if isinstance(seg_all, list) else seg_all
+                    patch_has_foreground_all = (
+                        full_resolution_seg.reshape(self.batch_size, -1)
+                        .gt(0)
+                        .any(dim=1)
+                        .float()
+                    )
                     del segs, images
 
             batch = {
@@ -1091,6 +1306,8 @@ class HemoDataLoader3D(DataLoader):
                 'context': context_all,
                 'hemorrhage_burden': torch.from_numpy(hemorrhage_burden_all).float(),
                 'trauma_target': torch.from_numpy(trauma_target_all).float(),
+                'sampling_mode': sampling_mode_all,
+                'patch_has_foreground': patch_has_foreground_all,
             }
             if self.dataset.use_dicom:
                 batch['dicom_numeric'] = torch.from_numpy(dicom_numeric_all).float()
@@ -1105,6 +1322,8 @@ class HemoDataLoader3D(DataLoader):
             'context': context_all,
             'hemorrhage_burden': hemorrhage_burden_all,
             'trauma_target': trauma_target_all,
+            'sampling_mode': sampling_mode_all,
+            'patch_has_foreground': patch_has_foreground_all,
         }
         if self.dataset.use_dicom:
             batch['dicom_numeric'] = dicom_numeric_all
@@ -1129,6 +1348,10 @@ def get_data_loaders(batch_size=4,
                       use_dicom=False,
                       train_csv=None,
                       valid_csv=None,
+                      vision_manifest_path=None,
+                      balanced_sampling=False,
+                      filter_invalid_supervision=False,
+                      labeled_validation_only=False,
                       return_metadata=False,
                      ):
     patch_size = tuple(patch_size)
@@ -1173,6 +1396,8 @@ def get_data_loaders(batch_size=4,
         include_demographics=include_demographics,
         use_dicom=use_dicom,
         exclude_case_ids=valid_case_ids,
+        vision_manifest_path=vision_manifest_path,
+        filter_invalid_supervision=filter_invalid_supervision,
         csv_path=train_csv,
     )
     val_ds = HemoDataset(
@@ -1189,9 +1414,18 @@ def get_data_loaders(batch_size=4,
         include_demographics=include_demographics,
         use_dicom=use_dicom,
         dicom_schema=train_ds.dicom_schema,
+        vision_manifest_path=vision_manifest_path,
+        filter_invalid_supervision=filter_invalid_supervision,
+        labeled_validation_only=labeled_validation_only,
         csv_path=valid_csv,
     )
-    train_loader = HemoDataLoader3D(train_ds, batch_size, transforms=tr_transforms, positive_prob=positive_prob)
+    train_loader = HemoDataLoader3D(
+        train_ds,
+        batch_size,
+        transforms=tr_transforms,
+        positive_prob=positive_prob,
+        balanced_sampling=balanced_sampling,
+    )
     val_loader = HemoDataLoader3D(val_ds, batch_size, transforms=val_transforms, positive_prob=1)
 
     mt_gen_train = NonDetMultiThreadedAugmenter(data_loader=train_loader, transform=None,
@@ -1210,6 +1444,8 @@ def get_data_loaders(batch_size=4,
             "dicom_schema": train_ds.dicom_schema,
             "train_samples": len(train_ds),
             "valid_samples": len(val_ds),
+            "train_dataset": train_ds,
+            "valid_dataset": val_ds,
             "safe_text_columns": list(SAFE_TEXT_COLUMNS),
         }
         return mt_gen_train, mt_gen_val, metadata

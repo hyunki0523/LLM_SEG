@@ -1,4 +1,4 @@
-import os, json, argparse, sys, site, copy
+import os, json, argparse, sys, site, copy, hashlib, math
 
 # [BUGFIX] bitsandbytes CUDA 12/13 library (libnvJitLink.so) 오류 방지용 동적 경로 주입
 try:
@@ -26,6 +26,7 @@ from datetime import timedelta
 from data.dataset import get_data_loaders
 from model_custom.stunet import get_stunet_base
 from model_custom.text_feature_cache import TextFeatureCache
+from utils.inference import predict_sliding_window_return_logits
 
 import warnings
 import wandb
@@ -126,6 +127,119 @@ def cycle(dl):
     while True:
         for data in dl:
             yield data
+
+
+def _stable_case_order(case_id, seed):
+    return hashlib.sha256(f"{seed}:{case_id}".encode("utf-8")).hexdigest()
+
+
+def select_sw_monitor_indices(dataset, positive_cases, normal_cases, seed):
+    """Select a deterministic lesion-size-stratified full-volume monitor set."""
+    if dataset.vision_manifest is None:
+        raise ValueError("SW monitor selection requires a vision manifest.")
+    positive_records = []
+    for index in dataset.positive_indices:
+        case_id = str(dataset.df.loc[index, dataset.case_id_col]).strip()
+        voxels = int(dataset.vision_manifest.loc[case_id, "actual_foreground_voxels"])
+        positive_records.append((index, case_id, voxels))
+    positive_records.sort(key=lambda item: (item[2], _stable_case_order(item[1], seed)))
+    selected_positive = []
+    if positive_records and positive_cases > 0:
+        for bin_records in np.array_split(np.asarray(positive_records, dtype=object), 4):
+            records = [tuple(record) for record in bin_records.tolist()]
+            records.sort(key=lambda item: _stable_case_order(item[1], seed))
+            quota = int(math.ceil(positive_cases / 4))
+            selected_positive.extend(records[:quota])
+        selected_positive = sorted(
+            selected_positive,
+            key=lambda item: _stable_case_order(item[1], seed),
+        )[:positive_cases]
+    negative_records = []
+    for index in dataset.negative_indices:
+        case_id = str(dataset.df.loc[index, dataset.case_id_col]).strip()
+        negative_records.append((index, case_id, 0))
+    negative_records.sort(key=lambda item: _stable_case_order(item[1], seed))
+    selected = selected_positive + negative_records[:normal_cases]
+    selected.sort(key=lambda item: _stable_case_order(item[1], seed))
+    return selected
+
+
+@torch.no_grad()
+def run_vision_sw_validation(
+    accelerator,
+    model,
+    dataset,
+    monitor_records,
+    patch_size,
+    step_size,
+    sw_batch_size,
+):
+    """Run paired deterministic full-volume metrics across distributed ranks."""
+    model.eval()
+    local_records = monitor_records[accelerator.process_index::accelerator.num_processes]
+    local_metrics = []
+    for monitor_index, (dataset_index, case_id, lesion_voxels) in enumerate(local_records):
+        sample = dataset.get_full_volume(int(dataset_index))
+        logits = predict_sliding_window_return_logits(
+            model,
+            sample["data"],
+            tuple(int(value) for value in patch_size),
+            device=accelerator.device,
+            step_size=float(step_size),
+            mirror_axes=None,
+            use_gaussian=True,
+            accumulation_dtype=torch.float32,
+            sw_batch_size=int(sw_batch_size),
+        )
+        if logits.shape[0] == 1:
+            prediction = torch.sigmoid(logits[0].float()).ge(0.5)
+        else:
+            prediction = logits.float().argmax(dim=0).eq(1)
+        prediction = prediction.cpu()
+        target = sample["target"].bool().cpu()
+        tp = int(torch.logical_and(prediction, target).sum().item())
+        fp = int(torch.logical_and(prediction, ~target).sum().item())
+        fn = int(torch.logical_and(~prediction, target).sum().item())
+        gt_voxels = tp + fn
+        denominator = 2 * tp + fp + fn
+        local_metrics.append(
+            {
+                "case_id": case_id,
+                "manifest_lesion_voxels": int(lesion_voxels),
+                "gt_is_positive": int(gt_voxels > 0),
+                "tp": tp,
+                "fp": fp,
+                "fn": fn,
+                "dice": 2.0 * tp / denominator if denominator else 1.0,
+                "sensitivity": tp / gt_voxels if gt_voxels else float("nan"),
+                "normal_no_fp": float(fp == 0) if not gt_voxels else float("nan"),
+            }
+        )
+        accelerator.print(
+            f"[SW MONITOR rank={accelerator.process_index}] "
+            f"{monitor_index + 1}/{len(local_records)} {case_id}"
+        )
+    gathered = gather_object(local_metrics)
+    flat = []
+    for item in gathered:
+        if isinstance(item, list):
+            flat.extend(item)
+        else:
+            flat.append(item)
+    positive = [row for row in flat if row["gt_is_positive"]]
+    normal = [row for row in flat if not row["gt_is_positive"]]
+    return {
+        "sw_valid_dice_positive": float(np.mean([row["dice"] for row in positive])),
+        "sw_valid_sensitivity_positive": float(
+            np.mean([row["sensitivity"] for row in positive])
+        ),
+        "sw_valid_normal_no_fp_rate": float(
+            np.mean([row["normal_no_fp"] for row in normal])
+        ),
+        "sw_valid_normal_total_fp_voxels": int(sum(row["fp"] for row in normal)),
+        "sw_valid_positive_cases": len(positive),
+        "sw_valid_normal_cases": len(normal),
+    }, flat
 
 
 def seed_everything(seed=42):
@@ -286,6 +400,14 @@ def get_args_parser():
     parser.add_argument('--n_iter_per_epoch', default=256, type=int)
     parser.add_argument('--n_iter_valid', default=50, type=int)
     parser.add_argument('--val_interval', default=1, type=int)
+    parser.add_argument(
+        '--max_optimizer_steps', default=0, type=int,
+        help='If >0, train to this many real optimizer updates regardless of epoch count.',
+    )
+    parser.add_argument(
+        '--warmup_optimizer_steps', default=0, type=int,
+        help='If >0, use this many optimizer updates for LR warmup.',
+    )
     parser.add_argument('--mixed_precision', default='no', type=str)
     parser.add_argument('--loss_fct', default='gdfl', type=str, choices=['dice', 'bce', 'dice_focal', 'tversky', 'gdfl'])
     parser.add_argument('--cls_loss_weight', default=0.0, type=float,
@@ -345,6 +467,30 @@ def get_args_parser():
     parser.add_argument('--num_workers', default=6, type=int)
     parser.add_argument('--seed', default=42, type=int)
     parser.add_argument('--positive_prob', default=0.8, type=float)
+    parser.add_argument('--vision_manifest', default=None, type=str)
+    parser.add_argument(
+        '--balanced_sampling', default=False,
+        action=argparse.BooleanOptionalAction,
+        help='Use exact 50/25/25 foreground/positive-random/normal-random sampling.',
+    )
+    parser.add_argument(
+        '--filter_invalid_supervision', default=False,
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        '--labeled_validation_only', default=False,
+        action=argparse.BooleanOptionalAction,
+    )
+    parser.add_argument(
+        '--sw_validation', default=False,
+        action=argparse.BooleanOptionalAction,
+        help='Run deterministic full-volume sliding-window monitor validation.',
+    )
+    parser.add_argument('--sw_valid_interval_steps', default=500, type=int)
+    parser.add_argument('--sw_valid_positive_cases', default=256, type=int)
+    parser.add_argument('--sw_valid_normal_cases', default=256, type=int)
+    parser.add_argument('--sw_valid_step_size', default=0.5, type=float)
+    parser.add_argument('--sw_valid_batch_size', default=4, type=int)
     parser.add_argument('--rater', default=1, type=rater_type)
     parser.add_argument('--patch_size', default=(16, 256, 256), type=int, nargs=3)
     parser.add_argument('--train_csv', default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/ICH_pair/train_split.csv", type=str)
@@ -447,6 +593,21 @@ def make_context_tokens_batch(tokenizer, max_length, context_length, contexts, d
 
 def main(args):
     seed_everything()
+    if args.max_optimizer_steps < 0 or args.warmup_optimizer_steps < 0:
+        raise ValueError("Optimizer-step limits must be non-negative.")
+    if args.balanced_sampling and not args.vision_manifest:
+        raise ValueError("--balanced_sampling requires --vision_manifest.")
+    if args.sw_validation:
+        if args.context or args.use_dicom:
+            raise ValueError(
+                "The first deterministic SW monitor is restricted to Vision-only training."
+            )
+        if not args.vision_manifest or not args.labeled_validation_only:
+            raise ValueError(
+                "--sw_validation requires --vision_manifest and --labeled_validation_only."
+            )
+        if args.sw_valid_interval_steps <= 0:
+            raise ValueError("--sw_valid_interval_steps must be positive.")
     if not 0.0 <= args.ema_decay < 1.0:
         raise ValueError("--ema_decay must satisfy 0 <= decay < 1.")
     if args.text_fusion_warmup_epochs < 0:
@@ -543,6 +704,12 @@ def main(args):
         "deep_supervision_weights": list(args.deep_supervision_weights),
         "soft_prompt_mode": args.soft_prompt_mode,
         "text_feature_cache": args.text_feature_cache or "",
+        "vision_manifest": args.vision_manifest or "",
+        "balanced_sampling": args.balanced_sampling,
+        "max_optimizer_steps": args.max_optimizer_steps,
+        "warmup_optimizer_steps": args.warmup_optimizer_steps,
+        "sw_validation": args.sw_validation,
+        "sw_valid_interval_steps": args.sw_valid_interval_steps,
         "memo": "자동생성된 실험 설정 로그"
     }
 
@@ -605,8 +772,47 @@ def main(args):
         dicom_prompt_mode=getattr(args, 'dicom_prompt_mode', 'full'),
         include_demographics=getattr(args, 'include_demographics', True),
         use_dicom=getattr(args, 'use_dicom', False),
+        vision_manifest_path=getattr(args, 'vision_manifest', None),
+        balanced_sampling=getattr(args, 'balanced_sampling', False),
+        filter_invalid_supervision=getattr(args, 'filter_invalid_supervision', False),
+        labeled_validation_only=getattr(args, 'labeled_validation_only', False),
         return_metadata=True,
     )
+    sw_monitor_records = []
+    sw_valid_dataset = data_metadata.get("valid_dataset")
+    if args.sw_validation:
+        sw_monitor_records = select_sw_monitor_indices(
+            sw_valid_dataset,
+            args.sw_valid_positive_cases,
+            args.sw_valid_normal_cases,
+            args.seed,
+        )
+        if not sw_monitor_records:
+            raise RuntimeError("SW validation monitor cohort is empty.")
+        accelerator.print(
+            f"[SW MONITOR] fixed cases={len(sw_monitor_records)} "
+            f"positive_target={args.sw_valid_positive_cases} "
+            f"normal_target={args.sw_valid_normal_cases}"
+        )
+        if accelerator.is_main_process:
+            os.makedirs(args.checkpoint_dir, exist_ok=True)
+            with open(
+                os.path.join(args.checkpoint_dir, "sw_monitor_cases.json"),
+                "w",
+                encoding="utf-8",
+            ) as monitor_file:
+                json.dump(
+                    [
+                        {
+                            "dataset_index": int(index),
+                            "case_id": case_id,
+                            "manifest_lesion_voxels": int(voxels),
+                        }
+                        for index, case_id, voxels in sw_monitor_records
+                    ],
+                    monitor_file,
+                    indent=2,
+                )
 
     # === Model / Optimizer / Scheduler ===
     if args.loss_fct == 'bce':
@@ -785,25 +991,50 @@ def main(args):
     # Gradient accumulation 적용 시 실제 optimizer step 수 계산 (1에폭당 업데이트 횟수)
     # n_iter_per_epoch // grad_accum 만큼 scheduler.step()이 일어납니다.
     steps_per_epoch = max(1, args.n_iter_per_epoch // args.grad_accum)
-    warmup_steps = steps_per_epoch * args.warmup_epochs
-    main_steps = steps_per_epoch * (args.epochs - args.warmup_epochs)
+    total_optimizer_steps = (
+        int(args.max_optimizer_steps)
+        if args.max_optimizer_steps > 0
+        else steps_per_epoch * args.epochs
+    )
+    required_epochs = int(math.ceil(total_optimizer_steps / steps_per_epoch))
+    if required_epochs > args.epochs:
+        accelerator.print(
+            f"[OPTIMIZER STEPS] extending epochs {args.epochs} -> {required_epochs} "
+            f"to reach {total_optimizer_steps} updates."
+        )
+        args.epochs = required_epochs
+    warmup_steps = (
+        int(args.warmup_optimizer_steps)
+        if args.warmup_optimizer_steps > 0
+        else steps_per_epoch * args.warmup_epochs
+    )
+    warmup_steps = min(warmup_steps, max(0, total_optimizer_steps - 1))
+    main_steps = max(1, total_optimizer_steps - warmup_steps)
+    accelerator.print(
+        f"[OPTIMIZER STEPS] steps_per_epoch={steps_per_epoch} "
+        f"total={total_optimizer_steps} warmup={warmup_steps}"
+    )
 
     # 1) Warmup: lr이 0 근처에서 1.0(args.lr)까지 서서히 증가
-    warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
-        optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
-    )
-    #2) Main: Cosine Annealing
     main_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(1, main_steps), eta_min=args.lr * 0.1
+        optimizer, T_max=main_steps, eta_min=args.lr * 0.1
     )
 
     # main_scheduler = torch.optim.lr_scheduler.LinearLR(
     #     optimizer, start_factor=1.0, end_factor=0.1, total_iters=main_steps
     # )
     
-    scheduler = torch.optim.lr_scheduler.SequentialLR(
-        optimizer, schedulers=[warmup_scheduler, main_scheduler], milestones=[warmup_steps]
-    )
+    if warmup_steps > 0:
+        warmup_scheduler = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps
+        )
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[warmup_steps],
+        )
+    else:
+        scheduler = main_scheduler
 
     # === [메모리 최적화 (팁 2): 안 쓰는 파라미터 강제 동결] ===
     # deep_supervision이 꺼져있을 때 버려지는 중간 seg_outputs 레이어들을 미리 얼려둡니다.
@@ -933,6 +1164,28 @@ def main(args):
         accelerator.print(f"[CHECK] EMA Model initialized with decay: {args.ema_decay}")
 
     train_iter, valid_iter = cycle(train_dl), cycle(valid_dl)
+    global_optimizer_step = int(
+        resume_ckpt.get(
+            "optimizer_step", max(0, (args.start_epoch - 1) * steps_per_epoch)
+        )
+        if resume_ckpt is not None
+        else 0
+    )
+    best_sw_dice = float(
+        resume_ckpt.get("best_sw_dice", resume_ckpt.get("val_dice", float("-inf")))
+        if resume_ckpt is not None
+        else float("-inf")
+    )
+    next_sw_validation_step = (
+        ((global_optimizer_step // args.sw_valid_interval_steps) + 1)
+        * args.sw_valid_interval_steps
+        if args.sw_validation
+        else None
+    )
+    accelerator.print(
+        f"[OPTIMIZER STEPS] starting_at={global_optimizer_step} "
+        f"target={total_optimizer_steps}"
+    )
     base = accelerator.unwrap_model(model)
     print("[CHECK] context flag:", getattr(base, "context", None))
     print("[CHECK] has tokenizer:", hasattr(base, "tokenizer"))
@@ -978,6 +1231,8 @@ def main(args):
 
     # === Training loop ===
     for epoch in range(args.start_epoch, args.epochs + 1):
+        if global_optimizer_step >= total_optimizer_steps:
+            break
         is_warmup = epoch <= args.warmup_epochs
         phase_str = "[Warmup] " if is_warmup else ""
         
@@ -1014,9 +1269,29 @@ def main(args):
         accumulated_seg_loss = 0.0
         accumulated_cls_loss = 0.0
         acc_step_count = 0
+        accumulated_patch_fg_sum = 0.0
+        accumulated_patch_count = 0
+        accumulated_sampling_counts = {
+            "foreground": 0,
+            "positive_random": 0,
+            "normal_random": 0,
+        }
 
         for n_iter in progress_bar:
             batch = next(train_iter)
+
+            if "patch_has_foreground" in batch:
+                patch_flags = batch["patch_has_foreground"]
+                if torch.is_tensor(patch_flags):
+                    accumulated_patch_fg_sum += float(patch_flags.float().sum().item())
+                    accumulated_patch_count += int(patch_flags.numel())
+                else:
+                    patch_array = np.asarray(patch_flags, dtype=np.float32)
+                    accumulated_patch_fg_sum += float(patch_array.sum())
+                    accumulated_patch_count += int(patch_array.size)
+            for sampling_mode in batch.get("sampling_mode", []):
+                if sampling_mode in accumulated_sampling_counts:
+                    accumulated_sampling_counts[sampling_mode] += 1
 
             image = batch['data'].to(accelerator.device)   # (B,3,D,H,W)
             mask = batch['target'].to(accelerator.device).float()  # (B,1,D,H,W)
@@ -1272,6 +1547,7 @@ def main(args):
 
             # accelerator.sync_gradients = TRUE 일 때가 실제 1개 축적 사이클이 완료된 시점입니다.
             if accelerator.sync_gradients:
+                global_optimizer_step += 1
                 avg_acc_loss = accumulated_loss / max(acc_step_count, 1)
                 avg_seg_loss = accumulated_seg_loss / max(acc_step_count, 1)
                 avg_cls_loss = accumulated_cls_loss / max(acc_step_count, 1)
@@ -1283,7 +1559,7 @@ def main(args):
                 # 실제 Weight Update가 일어날 때만 WandB에 seg_loss와 lr을 로깅합니다.
                 # (진동 없는 깨끗한 그래프를 보실 수 있습니다)
                 # X축(step) 기준을 과거 그래프들과 동일하게 맞추기 위해 실제 iteration 기준으로 로깅합니다.
-                global_step = n_iter + (epoch - 1) * args.n_iter_per_epoch
+                global_step = global_optimizer_step
                 
                 log_payload = {
                     'seg_loss': avg_seg_loss,
@@ -1292,6 +1568,15 @@ def main(args):
                     "lr": scheduler.get_last_lr()[-1],
                     'epoch': epoch
                 }
+                log_payload["optimizer_step"] = global_optimizer_step
+                if accumulated_patch_count:
+                    log_payload["train/actual_foreground_patch_rate"] = (
+                        accumulated_patch_fg_sum / accumulated_patch_count
+                    )
+                    for mode_name, mode_count in accumulated_sampling_counts.items():
+                        log_payload[f"train/sampling_{mode_name}_rate"] = (
+                            mode_count / accumulated_patch_count
+                        )
                 for loss_name, loss_value in auxiliary_losses.items():
                     log_payload[f"train/{loss_name}_loss"] = float(
                         loss_value.detach().item()
@@ -1325,8 +1610,18 @@ def main(args):
                 accumulated_seg_loss = 0.0
                 accumulated_cls_loss = 0.0
                 acc_step_count = 0
+                accumulated_patch_fg_sum = 0.0
+                accumulated_patch_count = 0
+                accumulated_sampling_counts = {
+                    "foreground": 0,
+                    "positive_random": 0,
+                    "normal_random": 0,
+                }
 
             accelerator.wait_for_everyone()
+
+            if global_optimizer_step >= total_optimizer_steps:
+                break
 
         loss_lists = gather_object(epoch_train_loss)
         flat_losses = []
@@ -1338,11 +1633,11 @@ def main(args):
         mean_train_loss = float(np.mean(flat_losses)) if flat_losses else float('nan')
         accelerator.print(f'Epoch {epoch} train loss: {mean_train_loss:.6f}')
         accelerator.log({"epoch_train_loss": mean_train_loss, "epoch": epoch},
-                        step=epoch * args.n_iter_per_epoch)
+                        step=global_optimizer_step)
 
         # === Validation ===
         val_dice_for_this_epoch = 0.0
-        if epoch % args.val_interval == 0:
+        if args.val_interval > 0 and epoch % args.val_interval == 0:
             eval_model = ema_model.module if ema_model is not None else model
             eval_model.eval()
             epoch_valid_tp, epoch_valid_fp, epoch_valid_fn = 0, 0, 0
@@ -1593,9 +1888,65 @@ def main(args):
             if wandb_seg_img is not None and accelerator.is_main_process:
                 log_dict["val/seg_sample"] = wandb_seg_img
                 
-            accelerator.log(log_dict, step=epoch * args.n_iter_per_epoch)
+            accelerator.log(log_dict, step=global_optimizer_step)
 
-        if args.checkpoint_interval > 0 and epoch % args.checkpoint_interval == 0:
+        sw_validation_ran = False
+        is_best_sw_checkpoint = False
+        if args.sw_validation and (
+            global_optimizer_step >= next_sw_validation_step
+            or global_optimizer_step >= total_optimizer_steps
+        ):
+            eval_model = (
+                ema_model.module
+                if ema_model is not None
+                else accelerator.unwrap_model(model)
+            )
+            sw_metrics, sw_case_metrics = run_vision_sw_validation(
+                accelerator,
+                eval_model,
+                sw_valid_dataset,
+                sw_monitor_records,
+                args.patch_size,
+                args.sw_valid_step_size,
+                args.sw_valid_batch_size,
+            )
+            sw_validation_ran = True
+            val_dice_for_this_epoch = sw_metrics["sw_valid_dice_positive"]
+            if val_dice_for_this_epoch > best_sw_dice:
+                best_sw_dice = val_dice_for_this_epoch
+                is_best_sw_checkpoint = True
+            accelerator.print(
+                "[SW MONITOR] "
+                f"step={global_optimizer_step} "
+                f"dice={sw_metrics['sw_valid_dice_positive']:.4f} "
+                f"sensitivity={sw_metrics['sw_valid_sensitivity_positive']:.4f} "
+                f"normal_no_fp={sw_metrics['sw_valid_normal_no_fp_rate']:.4f}"
+            )
+            accelerator.log(
+                {**sw_metrics, "epoch": epoch, "optimizer_step": global_optimizer_step},
+                step=global_optimizer_step,
+            )
+            if accelerator.is_main_process:
+                with open(
+                    os.path.join(
+                        args.checkpoint_dir,
+                        f"sw_monitor_step_{global_optimizer_step}.json",
+                    ),
+                    "w",
+                    encoding="utf-8",
+                ) as sw_file:
+                    json.dump(
+                        {"summary": sw_metrics, "cases": sw_case_metrics},
+                        sw_file,
+                        indent=2,
+                    )
+            while next_sw_validation_step <= global_optimizer_step:
+                next_sw_validation_step += args.sw_valid_interval_steps
+
+        periodic_checkpoint = (
+            args.checkpoint_interval > 0 and epoch % args.checkpoint_interval == 0
+        )
+        if periodic_checkpoint or sw_validation_ran or global_optimizer_step >= total_optimizer_steps:
             unwrapped = accelerator.unwrap_model(ema_model.module if ema_model is not None else model)
             checkpoint = {
                 'model': trainable_state_dict(unwrapped, include_buffers=True),  # ✅ trainable만
@@ -1603,6 +1954,8 @@ def main(args):
                 'scheduler': scheduler.state_dict(),                              # ✅ scheduler 상태
                 'val_dice': val_dice_for_this_epoch,
                 'epoch': epoch,
+                'optimizer_step': global_optimizer_step,
+                'best_sw_dice': best_sw_dice,
                 'dicom_schema': dicom_schema,
             }
             if ema_model is not None:
@@ -1611,6 +1964,14 @@ def main(args):
                 )
                 checkpoint['ema_n_averaged'] = int(ema_model.n_averaged.item())
             accelerator.save(checkpoint, os.path.join(args.checkpoint_dir, f'model_epoch_{epoch}.pth'))
+            if is_best_sw_checkpoint:
+                accelerator.save(
+                    checkpoint,
+                    os.path.join(args.checkpoint_dir, 'best_sw_model.pth'),
+                )
+                accelerator.print(
+                    f"[SW MONITOR] New best checkpoint: dice={best_sw_dice:.4f}"
+                )
             accelerator.print(f"Saved checkpoint for epoch {epoch} (val_dice: {val_dice_for_this_epoch:.4f}) [with optimizer & scheduler state]")
 
     # === Save final model ===
