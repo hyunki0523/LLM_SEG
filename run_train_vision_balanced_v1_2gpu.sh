@@ -23,10 +23,12 @@ fi
 LOG_ROOT="${LOG_ROOT:-${PROJECT_DIR}/train_logs/vision_balanced_v11_2gpu_${run_kind}_seed${SEED}_$(date +%Y%m%d_%H%M%S)}"
 
 PATCH_SIZE="${PATCH_SIZE:-32 224 224}"
+SW_VALID_PATCH_SIZE="${SW_VALID_PATCH_SIZE:-32 224 224}"
 BATCH_SIZE="${BATCH_SIZE:-2}"
 GRAD_ACCUM="${GRAD_ACCUM:-8}"
 N_ITER_PER_EPOCH="${N_ITER_PER_EPOCH:-128}"
 MAX_OPTIMIZER_STEPS="${MAX_OPTIMIZER_STEPS:-5000}"
+STOP_OPTIMIZER_STEPS="${STOP_OPTIMIZER_STEPS:-0}"
 WARMUP_OPTIMIZER_STEPS="${WARMUP_OPTIMIZER_STEPS:-250}"
 EPOCHS="${EPOCHS:-313}"
 LR="${LR:-1e-5}"
@@ -37,6 +39,8 @@ SW_VALID_POSITIVE_CASES="${SW_VALID_POSITIVE_CASES:-128}"
 SW_VALID_NORMAL_CASES="${SW_VALID_NORMAL_CASES:-128}"
 SW_VALID_BATCH_SIZE="${SW_VALID_BATCH_SIZE:-4}"
 CHECKPOINT_INTERVAL="${CHECKPOINT_INTERVAL:-32}"
+BRAIN_AWARE_RANDOM_SAMPLING="${BRAIN_AWARE_RANDOM_SAMPLING:-0}"
+BRAIN_RANDOM_HU_THRESHOLD="${BRAIN_RANDOM_HU_THRESHOLD:--200}"
 MANIFEST_WORKERS="${MANIFEST_WORKERS:-12}"
 MANIFEST_ONLY="${MANIFEST_ONLY:-0}"
 if [ -z "${AUTO_RESUME:-}" ]; then
@@ -112,6 +116,11 @@ run_log="${LOG_ROOT}/vision_balanced_v1.log"
 echo "[LAUNCH] Vision-Balanced-v1 on GPUs $GPU_PAIR"
 echo "[LOG] $run_log"
 
+brain_sampling_args=(--no-brain_aware_random_sampling)
+if [ "$BRAIN_AWARE_RANDOM_SAMPLING" = "1" ]; then
+    brain_sampling_args=(--brain_aware_random_sampling)
+fi
+
 CUDA_VISIBLE_DEVICES="$GPU_PAIR" \
 accelerate launch \
     --num_processes 2 \
@@ -134,7 +143,10 @@ accelerate launch \
     --sw_valid_normal_cases "$SW_VALID_NORMAL_CASES" \
     --sw_valid_step_size 0.5 \
     --sw_valid_batch_size "$SW_VALID_BATCH_SIZE" \
+    --sw_valid_patch_size $SW_VALID_PATCH_SIZE \
     --patch_size $PATCH_SIZE \
+    "${brain_sampling_args[@]}" \
+    --brain_random_hu_threshold "$BRAIN_RANDOM_HU_THRESHOLD" \
     --batch_size "$BATCH_SIZE" \
     --grad_accum "$GRAD_ACCUM" \
     --n_iter_per_epoch "$N_ITER_PER_EPOCH" \
@@ -142,6 +154,7 @@ accelerate launch \
     --val_interval 0 \
     --epochs "$EPOCHS" \
     --max_optimizer_steps "$MAX_OPTIMIZER_STEPS" \
+    --stop_optimizer_steps "$STOP_OPTIMIZER_STEPS" \
     --warmup_optimizer_steps "$WARMUP_OPTIMIZER_STEPS" \
     --lr "$LR" \
     --seed "$SEED" \

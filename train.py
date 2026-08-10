@@ -1,4 +1,4 @@
-import os, json, argparse, sys, site, copy, hashlib, math, random
+import os, json, argparse, sys, site, copy, hashlib, math, random, shutil
 
 # [BUGFIX] bitsandbytes CUDA 12/13 library (libnvJitLink.so) 오류 방지용 동적 경로 주입
 try:
@@ -411,6 +411,13 @@ def get_args_parser():
         help='If >0, train to this many real optimizer updates regardless of epoch count.',
     )
     parser.add_argument(
+        '--stop_optimizer_steps', default=0, type=int,
+        help=(
+            'Optional screening stop while retaining the LR schedule defined by '
+            '--max_optimizer_steps for a later exact resume.'
+        ),
+    )
+    parser.add_argument(
         '--warmup_optimizer_steps', default=0, type=int,
         help='If >0, use this many optimizer updates for LR warmup.',
     )
@@ -480,6 +487,15 @@ def get_args_parser():
         help='Use exact 50/25/25 foreground/positive-random/normal-random sampling.',
     )
     parser.add_argument(
+        '--brain_aware_random_sampling', default=False,
+        action=argparse.BooleanOptionalAction,
+        help=(
+            'Centre positive-random and normal-random patches on head-density '
+            'tissue instead of accepting trivial air/table negatives.'
+        ),
+    )
+    parser.add_argument('--brain_random_hu_threshold', default=-200.0, type=float)
+    parser.add_argument(
         '--filter_invalid_supervision', default=False,
         action=argparse.BooleanOptionalAction,
     )
@@ -497,6 +513,10 @@ def get_args_parser():
     parser.add_argument('--sw_valid_normal_cases', default=256, type=int)
     parser.add_argument('--sw_valid_step_size', default=0.5, type=float)
     parser.add_argument('--sw_valid_batch_size', default=4, type=int)
+    parser.add_argument(
+        '--sw_valid_patch_size', default=None, type=int, nargs=3,
+        help='Fixed SW monitor patch size independent of the training patch.',
+    )
     parser.add_argument('--rater', default=1, type=rater_type)
     parser.add_argument('--patch_size', default=(16, 256, 256), type=int, nargs=3)
     parser.add_argument('--train_csv', default="/mnt/nas206/forGPU/lhyunki/NeuroCAD/data/CSV/ICH_pair/train_split.csv", type=str)
@@ -599,7 +619,11 @@ def make_context_tokens_batch(tokenizer, max_length, context_length, contexts, d
 
 def main(args):
     seed_everything(args.seed)
-    if args.max_optimizer_steps < 0 or args.warmup_optimizer_steps < 0:
+    if (
+        args.max_optimizer_steps < 0
+        or args.stop_optimizer_steps < 0
+        or args.warmup_optimizer_steps < 0
+    ):
         raise ValueError("Optimizer-step limits must be non-negative.")
     if args.balanced_sampling and not args.vision_manifest:
         raise ValueError("--balanced_sampling requires --vision_manifest.")
@@ -721,10 +745,16 @@ def main(args):
         "text_feature_cache": args.text_feature_cache or "",
         "vision_manifest": args.vision_manifest or "",
         "balanced_sampling": args.balanced_sampling,
+        "brain_aware_random_sampling": args.brain_aware_random_sampling,
+        "brain_random_hu_threshold": args.brain_random_hu_threshold,
         "max_optimizer_steps": args.max_optimizer_steps,
+        "stop_optimizer_steps": args.stop_optimizer_steps,
         "warmup_optimizer_steps": args.warmup_optimizer_steps,
         "sw_validation": args.sw_validation,
         "sw_valid_interval_steps": args.sw_valid_interval_steps,
+        "sw_valid_patch_size": list(
+            args.sw_valid_patch_size or args.patch_size
+        ),
         "seed": args.seed,
         "memo": "자동생성된 실험 설정 로그"
     }
@@ -790,6 +820,12 @@ def main(args):
         use_dicom=getattr(args, 'use_dicom', False),
         vision_manifest_path=getattr(args, 'vision_manifest', None),
         balanced_sampling=getattr(args, 'balanced_sampling', False),
+        brain_aware_random_sampling=getattr(
+            args, 'brain_aware_random_sampling', False
+        ),
+        brain_random_hu_threshold=getattr(
+            args, 'brain_random_hu_threshold', -200.0
+        ),
         filter_invalid_supervision=getattr(args, 'filter_invalid_supervision', False),
         labeled_validation_only=getattr(args, 'labeled_validation_only', False),
         return_metadata=True,
@@ -1012,6 +1048,11 @@ def main(args):
         if args.max_optimizer_steps > 0
         else steps_per_epoch * args.epochs
     )
+    training_stop_steps = (
+        min(int(args.stop_optimizer_steps), total_optimizer_steps)
+        if args.stop_optimizer_steps > 0
+        else total_optimizer_steps
+    )
     required_epochs = int(math.ceil(total_optimizer_steps / steps_per_epoch))
     if required_epochs > args.epochs:
         accelerator.print(
@@ -1029,6 +1070,10 @@ def main(args):
     accelerator.print(
         f"[OPTIMIZER STEPS] steps_per_epoch={steps_per_epoch} "
         f"total={total_optimizer_steps} warmup={warmup_steps}"
+    )
+    accelerator.print(
+        f"[RUN STOP] optimizer_step={training_stop_steps} "
+        f"(scheduler remains defined through {total_optimizer_steps})"
     )
 
     # 1) Warmup: lr이 0 근처에서 1.0(args.lr)까지 서서히 증가
@@ -1258,7 +1303,7 @@ def main(args):
 
     # === Training loop ===
     for epoch in range(args.start_epoch, args.epochs + 1):
-        if global_optimizer_step >= total_optimizer_steps:
+        if global_optimizer_step >= training_stop_steps:
             break
         is_warmup = epoch <= args.warmup_epochs
         phase_str = "[Warmup] " if is_warmup else ""
@@ -1665,7 +1710,7 @@ def main(args):
 
             accelerator.wait_for_everyone()
 
-            if global_optimizer_step >= total_optimizer_steps:
+            if global_optimizer_step >= training_stop_steps:
                 break
 
         loss_lists = gather_object(epoch_train_loss)
@@ -1939,7 +1984,7 @@ def main(args):
         is_best_sw_checkpoint = False
         if args.sw_validation and (
             global_optimizer_step >= next_sw_validation_step
-            or global_optimizer_step >= total_optimizer_steps
+            or global_optimizer_step >= training_stop_steps
         ):
             eval_model = (
                 ema_model.module
@@ -1951,7 +1996,7 @@ def main(args):
                 eval_model,
                 sw_valid_dataset,
                 sw_monitor_records,
-                args.patch_size,
+                args.sw_valid_patch_size or args.patch_size,
                 args.sw_valid_step_size,
                 args.sw_valid_batch_size,
             )
@@ -1991,7 +2036,7 @@ def main(args):
         periodic_checkpoint = (
             args.checkpoint_interval > 0 and epoch % args.checkpoint_interval == 0
         )
-        if periodic_checkpoint or sw_validation_ran or global_optimizer_step >= total_optimizer_steps:
+        if periodic_checkpoint or sw_validation_ran or global_optimizer_step >= training_stop_steps:
             scheduler_update_step = int(
                 scheduler.state_dict().get("last_epoch", -1)
             )
@@ -2020,12 +2065,27 @@ def main(args):
                     accelerator.unwrap_model(model), include_buffers=True
                 )
                 checkpoint['ema_n_averaged'] = int(ema_model.n_averaged.item())
-            accelerator.save(checkpoint, os.path.join(args.checkpoint_dir, f'model_epoch_{epoch}.pth'))
+            epoch_checkpoint_path = os.path.join(
+                args.checkpoint_dir, f'model_epoch_{epoch}.pth'
+            )
+            incomplete_path = epoch_checkpoint_path + '.incomplete'
+            accelerator.save(checkpoint, incomplete_path)
+            accelerator.wait_for_everyone()
+            if accelerator.is_main_process:
+                os.replace(incomplete_path, epoch_checkpoint_path)
+            accelerator.wait_for_everyone()
             if is_best_sw_checkpoint:
-                accelerator.save(
-                    checkpoint,
-                    os.path.join(args.checkpoint_dir, 'best_sw_model.pth'),
-                )
+                if accelerator.is_main_process:
+                    best_path = os.path.join(args.checkpoint_dir, 'best_sw_model.pth')
+                    best_incomplete = best_path + '.incomplete'
+                    try:
+                        if os.path.lexists(best_incomplete):
+                            os.remove(best_incomplete)
+                        os.link(epoch_checkpoint_path, best_incomplete)
+                    except OSError:
+                        shutil.copy2(epoch_checkpoint_path, best_incomplete)
+                    os.replace(best_incomplete, best_path)
+                accelerator.wait_for_everyone()
                 accelerator.print(
                     f"[SW MONITOR] New best checkpoint: dice={best_sw_dice:.4f}"
                 )
@@ -2034,7 +2094,13 @@ def main(args):
     # === Save final model ===
     unwrapped = accelerator.unwrap_model(ema_model.module if ema_model is not None else model)
     sd = trainable_state_dict(unwrapped, include_buffers=True)
-    accelerator.save(sd, os.path.join(args.checkpoint_dir, 'final_model.pth'))
+    final_path = os.path.join(args.checkpoint_dir, 'final_model.pth')
+    final_incomplete = final_path + '.incomplete'
+    accelerator.save(sd, final_incomplete)
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        os.replace(final_incomplete, final_path)
+    accelerator.wait_for_everyone()
     accelerator.end_training()
 
 

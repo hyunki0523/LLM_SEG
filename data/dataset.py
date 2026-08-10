@@ -420,7 +420,9 @@ def get_valid_center_with_jitter(base_center, patch_size, image_shape, jitter_ra
 
 def extract_patches(image, mask, 
                     sample_positive=True, 
-                    patch_size=(32, 256, 256)):
+                    patch_size=(32, 256, 256),
+                    brain_aware_random=False,
+                    brain_random_hu_threshold=-200.0):
     
     # Ensure image and mask are the same shape
     assert image.shape == mask.shape, "Image and mask shapes do not match before padding."
@@ -453,8 +455,26 @@ def extract_patches(image, mask,
         start = [center[i] - patch_size[i] // 2 for i in range(3)]
         end = [start[i] + patch_size[i] for i in range(3)]
     else:
-        # For non-positive patches, ensure the center stays within bounds
-        center = [np.random.randint(patch_size[i] // 2, (image.shape[i] - patch_size[i] // 2 )+1) for i in range(3)]
+        # Optionally keep random patches centred on head-density tissue. This
+        # replaces trivial air/table negatives with skull/calcification and
+        # other regions that can produce realistic false positives.
+        def draw_center():
+            return [
+                np.random.randint(
+                    patch_size[i] // 2,
+                    image.shape[i] - (patch_size[i] - patch_size[i] // 2) + 1,
+                )
+                for i in range(3)
+            ]
+
+        center = draw_center()
+        if brain_aware_random:
+            for _ in range(64):
+                candidate = draw_center()
+                value = image[tuple(candidate)]
+                if np.isfinite(value) and value > brain_random_hu_threshold:
+                    center = candidate
+                    break
 
         # Calculate the start and end of the patch
         start = [center[i] - patch_size[i] // 2 for i in range(3)]
@@ -710,10 +730,14 @@ class HemoDataset(Dataset):
         vision_manifest_path: Optional[Union[str, Path]] = None,
         filter_invalid_supervision: bool = False,
         labeled_validation_only: bool = False,
+        brain_aware_random_sampling: bool = False,
+        brain_random_hu_threshold: float = -200.0,
         prompt_args: Optional[SimpleNamespace] = None,
         csv_path: Optional[Union[str, Path]] = None, 
     ):
         print(patch_size)
+        self.brain_aware_random_sampling = bool(brain_aware_random_sampling)
+        self.brain_random_hu_threshold = float(brain_random_hu_threshold)
         # 1) CSV 로드 (항상 self.df를 먼저 만든 다음 print)
         if csv_path is not None:
             self.csv_path = Path(csv_path)
@@ -1147,7 +1171,16 @@ class HemoDataset(Dataset):
         if img.shape != mask.shape:
             img, mask = match_img_mask_shape(img, mask, pad_value_img=-1024, pad_value_mask=0)
 
-        img, mask = extract_patches(img, mask, sample_positive=sample_positive, patch_size=self.patch_size)
+        img, mask = extract_patches(
+            img,
+            mask,
+            sample_positive=sample_positive,
+            patch_size=self.patch_size,
+            brain_aware_random=(
+                self.brain_aware_random_sampling and not sample_positive
+            ),
+            brain_random_hu_threshold=self.brain_random_hu_threshold,
+        )
 
         img = windowing_3ch(img)
         mask = (mask > 0).astype(np.uint8)[None, ...]
@@ -1376,6 +1409,8 @@ def get_data_loaders(batch_size=4,
                       balanced_sampling=False,
                       filter_invalid_supervision=False,
                       labeled_validation_only=False,
+                      brain_aware_random_sampling=False,
+                      brain_random_hu_threshold=-200.0,
                       return_metadata=False,
                      ):
     patch_size = tuple(patch_size)
@@ -1422,6 +1457,8 @@ def get_data_loaders(batch_size=4,
         exclude_case_ids=valid_case_ids,
         vision_manifest_path=vision_manifest_path,
         filter_invalid_supervision=filter_invalid_supervision,
+        brain_aware_random_sampling=brain_aware_random_sampling,
+        brain_random_hu_threshold=brain_random_hu_threshold,
         csv_path=train_csv,
     )
     val_ds = HemoDataset(
@@ -1441,6 +1478,8 @@ def get_data_loaders(batch_size=4,
         vision_manifest_path=vision_manifest_path,
         filter_invalid_supervision=filter_invalid_supervision,
         labeled_validation_only=labeled_validation_only,
+        brain_aware_random_sampling=False,
+        brain_random_hu_threshold=brain_random_hu_threshold,
         csv_path=valid_csv,
     )
     train_loader = HemoDataLoader3D(
